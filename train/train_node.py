@@ -36,7 +36,7 @@ ENV_CONFIG = {
         'v_switch': 7.319,
         'a_max'   : 9.51,
         'v_min'   : 0.1,
-        'v_max'   : 20.0,        #수치 안정성을 위해 실제 제어 속도는 별도 스케일링
+        'v_max'   : 20.0,
         'width'   : 0.31,
         'length'  : 0.58,
     }
@@ -55,23 +55,22 @@ MODEL_CONFIG = {
 }
 
 TRAIN_CONFIG = {
-    'buffer_size'  : 10000,
-    'batch_size'   : 64,
+    'buffer_size'  : 100000,
+    'batch_size'   : 256,
     'gamma'        : 0.99,
     'tau'          : 0.005,
     'lr_actor'     : 3e-4,
     'lr_critic'    : 3e-4,
-    'lr_alpha'     : 3e-4,
-    'max_episodes' : 200,
+    'lr_alpha'     : 1e-3,
+    'max_episodes' : 1000,
     'max_steps'    : 2000,
     'eval_interval': 50,
-    'warmup_steps' : 500,
+    'warmup_steps' : 2000,
 }
 
 # SAC action(-1~1) → f110_gym 실제 제어값 변환 범위
-# v_max를 20.0으로 두되, 실제 학습 중엔 안전한 범위만 사용
 ACTION_SPEED_MIN = 0.1    # m/s
-ACTION_SPEED_MAX = 10.0    # m/s 
+ACTION_SPEED_MAX = 20.0   # m/s
 ACTION_STEER_MAX = 0.4189 # rad
 
 MODEL_SAVE_PATH = os.path.join(os.path.dirname(__file__),
@@ -84,10 +83,33 @@ def action_to_env(action: np.ndarray) -> np.ndarray:
     SAC 출력 (-1~1) → f110_gym 입력 [steering_angle, speed]
     f110_gym은 실제 물리값(rad, m/s)을 직접 받음
     """
-    steering = float(action[0]) * ACTION_STEER_MAX          # -0.4189 ~ 0.4189 rad
-    speed_norm = (float(action[1]) + 1.0) / 2.0             # 0 ~ 1
+    steering = float(action[0]) * ACTION_STEER_MAX
+    speed_norm = (float(action[1]) + 1.0) / 2.0
     speed = ACTION_SPEED_MIN + speed_norm * (ACTION_SPEED_MAX - ACTION_SPEED_MIN)
     return np.array([steering, speed], dtype=np.float32)
+
+
+# ── 커스텀 reward 함수 ────────────────────────────────────────────────────────
+def compute_reward(next_obs: dict, action: np.ndarray) -> float:
+    """
+    커스텀 reward 함수
+    - 충돌: -100.0 페널티
+    - 속도: 빠를수록 높은 보상
+    - 조향: 급조향 페널티 (바퀴 떨림 억제)
+    """
+    speed     = float(next_obs['linear_vels_x'][0])
+    collision = bool(next_obs['collisions'][0])
+
+    if collision:
+        return -100.0
+
+    # 속도 보상: 빠를수록 높은 reward (0~1)
+    speed_reward = speed / ACTION_SPEED_MAX
+
+    # 조향 안정성: 급격한 조향 페널티
+    #steer_penalty = -0.1 * abs(float(action[0]))
+
+    return speed_reward #+ steer_penalty
 
 
 # ── 상태 유효성 검사 ──────────────────────────────────────────────────────────
@@ -111,7 +133,7 @@ def build_model(obs_dim: int) -> torch.nn.Module:
 # ── 전처리 함수 ───────────────────────────────────────────────────────────────
 def preprocess_obs(obs: dict) -> np.ndarray:
     lidar = obs['scans'][0].astype(np.float32)
-    lidar = np.where(np.isfinite(lidar), lidar, OBS_CONFIG['lidar_range_max'])  # nan/inf → max로 대체
+    lidar = np.where(np.isfinite(lidar), lidar, OBS_CONFIG['lidar_range_max'])
     lidar = np.clip(lidar,
                     OBS_CONFIG['lidar_range_min'],
                     OBS_CONFIG['lidar_range_max'])
@@ -178,7 +200,7 @@ class Trainer:
         self.critic2_optimizer = optim.Adam(
             self.model.critic2.parameters(), lr=TRAIN_CONFIG['lr_critic'])
 
-        self.target_entropy  = -MODEL_CONFIG['action_dim']
+        self.target_entropy = -MODEL_CONFIG['action_dim'] * 0.5
         self.log_alpha       = torch.zeros(1, requires_grad=True, device=self.device)
         self.alpha           = self.log_alpha.exp()
         self.alpha_optimizer = optim.Adam(
@@ -248,9 +270,13 @@ class Trainer:
             done         = False
             for _ in range(TRAIN_CONFIG['max_steps']):
                 action     = self.model.select_action(obs, training=False)
-                env_action = action_to_env(action)                        # [수정 2 적용]
-                obs, reward, done, _ = env.step(np.array([env_action]))
-                obs          = preprocess_obs(obs)
+                env_action = action_to_env(action)
+                next_obs, reward, done, _ = env.step(np.array([env_action]))
+
+                # 커스텀 reward 적용
+                reward = compute_reward(next_obs, action)
+
+                obs          = preprocess_obs(next_obs)
                 total_reward += reward
                 if done:
                     break
@@ -301,13 +327,20 @@ def main():
                 ], dtype=np.float32)
             else:
                 action = trainer.model.select_action(obs, training=True)
+                # 탐색 노이즈 추가
+                action = action + np.random.normal(0, 0.1, size=action.shape)
+                action = np.clip(action, -1.0, 1.0)
 
-            # [수정 2 적용] SAC(-1~1) → 실제 물리값으로 변환 후 환경에 전달
+            # SAC(-1~1) → 실제 물리값으로 변환 후 환경에 전달
             env_action = action_to_env(action)
             next_obs, reward, done, _ = env.step(np.array([env_action]))
+
+            # 커스텀 reward 적용
+            reward = compute_reward(next_obs, action)
+
             next_obs_processed = preprocess_obs(next_obs)
 
-            # [수정 3 적용] nan/inf가 섞인 transition은 버퍼에서 제외
+            # nan/inf가 섞인 transition은 버퍼에서 제외
             if is_valid_obs(obs) and is_valid_obs(next_obs_processed):
                 trainer.buffer.push(obs, action, reward, next_obs_processed, float(done))
 

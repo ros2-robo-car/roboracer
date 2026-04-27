@@ -120,8 +120,10 @@ class SAC(nn.Module):
         """
         with torch.no_grad():
             state = torch.FloatTensor(state).unsqueeze(0)
+            device = next(self.parameters()).device
+            state = state.to(device)
             if training:
                 action, _ = self.actor.sample(state)
             else:
                 action = self.actor.get_action(state)
-        return action.squeeze(0).numpy()
+        return action.squeeze(0).cpu().numpy()
