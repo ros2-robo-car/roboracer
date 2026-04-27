@@ -36,7 +36,7 @@ ENV_CONFIG = {
         'v_switch': 7.319,
         'a_max'   : 9.51,
         'v_min'   : 0.1,
-        'v_max'   : 20.0,        # [수정 1] 수치 안정성을 위해 실제 제어 속도는 별도 스케일링
+        'v_max'   : 20.0,        #수치 안정성을 위해 실제 제어 속도는 별도 스케일링
         'width'   : 0.31,
         'length'  : 0.58,
     }
@@ -49,9 +49,9 @@ OBS_CONFIG = {
 }
 
 MODEL_CONFIG = {
-    'type'      : 'SAC',
-    'hidden_dim': 256,
-    'action_dim': 2,
+    'type'       : 'SAC',
+    'hidden_dims': [1024, 512, 1024, 1024, 512, 256],
+    'action_dim' : 2,
 }
 
 TRAIN_CONFIG = {
@@ -68,10 +68,10 @@ TRAIN_CONFIG = {
     'warmup_steps' : 500,
 }
 
-# [수정 2] SAC action(-1~1) → f110_gym 실제 제어값 변환 범위
+# SAC action(-1~1) → f110_gym 실제 제어값 변환 범위
 # v_max를 20.0으로 두되, 실제 학습 중엔 안전한 범위만 사용
 ACTION_SPEED_MIN = 0.1    # m/s
-ACTION_SPEED_MAX = 10.0    # m/s  ← 수치 폭발 방지를 위해 낮게 설정
+ACTION_SPEED_MAX = 10.0    # m/s 
 ACTION_STEER_MAX = 0.4189 # rad
 
 MODEL_SAVE_PATH = os.path.join(os.path.dirname(__file__),
@@ -98,12 +98,12 @@ def is_valid_obs(obs: np.ndarray) -> bool:
 
 # ── 모델 팩토리 ───────────────────────────────────────────────────────────────
 def build_model(obs_dim: int) -> torch.nn.Module:
-    model_type = MODEL_CONFIG['type']
-    action_dim = MODEL_CONFIG['action_dim']
-    hidden_dim = MODEL_CONFIG['hidden_dim']
+    model_type  = MODEL_CONFIG['type']
+    action_dim  = MODEL_CONFIG['action_dim']
+    hidden_dims = MODEL_CONFIG['hidden_dims']
 
     if model_type == 'SAC':
-        return SAC(obs_dim, action_dim, hidden_dim)
+        return SAC(obs_dim, action_dim, hidden_dims)
     else:
         raise ValueError(f'지원하지 않는 모델 타입: {model_type}')
 
@@ -111,7 +111,7 @@ def build_model(obs_dim: int) -> torch.nn.Module:
 # ── 전처리 함수 ───────────────────────────────────────────────────────────────
 def preprocess_obs(obs: dict) -> np.ndarray:
     lidar = obs['scans'][0].astype(np.float32)
-    lidar = np.where(np.isfinite(lidar), lidar, OBS_CONFIG['lidar_range_max'])  # [수정 3] nan/inf → max로 대체
+    lidar = np.where(np.isfinite(lidar), lidar, OBS_CONFIG['lidar_range_max'])  # nan/inf → max로 대체
     lidar = np.clip(lidar,
                     OBS_CONFIG['lidar_range_min'],
                     OBS_CONFIG['lidar_range_max'])

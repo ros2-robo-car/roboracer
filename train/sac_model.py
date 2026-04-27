@@ -14,19 +14,20 @@ class Actor(nn.Module):
     상태(observation)를 입력받아 행동(action)을 출력하는 신경망
     출력: 조향각, 속도 (연속적인 값)
     """
-    def __init__(self, obs_dim, action_dim, hidden_dim=256):
+    def __init__(self, obs_dim, action_dim, hidden_dims=[1024, 512, 1024, 1024, 512, 256]):
         super().__init__()
 
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
+        layers = []
+        in_dim = obs_dim
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.ReLU())
+            in_dim = h_dim
+        self.net = nn.Sequential(*layers)
 
         # 평균과 표준편차를 따로 출력 (확률적 행동 선택)
-        self.mean_layer = nn.Linear(hidden_dim, action_dim)
-        self.log_std_layer = nn.Linear(hidden_dim, action_dim)
+        self.mean_layer = nn.Linear(hidden_dims[-1], action_dim)
+        self.log_std_layer = nn.Linear(hidden_dims[-1], action_dim)
 
     def forward(self, state):
         x = self.net(state)
@@ -74,16 +75,17 @@ class Critic(nn.Module):
     상태(observation) + 행동(action)을 입력받아 Q값을 출력하는 신경망
     Q값: 해당 행동이 얼마나 좋은지 나타내는 점수
     """
-    def __init__(self, obs_dim, action_dim, hidden_dim=256):
+    def __init__(self, obs_dim, action_dim, hidden_dims=[1024, 512, 1024, 1024, 512, 256]):
         super().__init__()
 
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        layers = []
+        in_dim = obs_dim + action_dim
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.ReLU())
+            in_dim = h_dim
+        layers.append(nn.Linear(hidden_dims[-1], 1))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, state, action):
         x = torch.cat([state, action], dim=-1)
@@ -95,16 +97,16 @@ class SAC(nn.Module):
     SAC (Soft Actor-Critic) 전체 모델
     Actor 1개 + Critic 2개로 구성
     """
-    def __init__(self, obs_dim, action_dim, hidden_dim=256):
+    def __init__(self, obs_dim, action_dim, hidden_dims=[1024, 512, 1024, 1024, 512, 256]):
         super().__init__()
 
-        self.actor    = Actor(obs_dim, action_dim, hidden_dim)
-        self.critic1  = Critic(obs_dim, action_dim, hidden_dim)
-        self.critic2  = Critic(obs_dim, action_dim, hidden_dim)
+        self.actor   = Actor(obs_dim, action_dim, hidden_dims)
+        self.critic1 = Critic(obs_dim, action_dim, hidden_dims)
+        self.critic2 = Critic(obs_dim, action_dim, hidden_dims)
 
         # Target Critic (안정적인 학습을 위해 사용)
-        self.target_critic1 = Critic(obs_dim, action_dim, hidden_dim)
-        self.target_critic2 = Critic(obs_dim, action_dim, hidden_dim)
+        self.target_critic1 = Critic(obs_dim, action_dim, hidden_dims)
+        self.target_critic2 = Critic(obs_dim, action_dim, hidden_dims)
 
         # Target Critic을 Critic과 동일하게 초기화
         self.target_critic1.load_state_dict(self.critic1.state_dict())

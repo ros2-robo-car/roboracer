@@ -15,7 +15,8 @@ from std_msgs.msg import Float32MultiArray
 # ── 설정 ─────────────────────────────────────────────────────────────────────
 OBS_DIM    = 108   # perception_node 출력 크기
 ACTION_DIM = 2     # 조향각, 속도
-HIDDEN_DIM = 256
+HIDDEN_DIMS = [1024, 512, 1024, 1024, 512, 256]
+self.model = SAC(OBS_DIM, ACTION_DIM, HIDDEN_DIMS).to(self.device)
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__),
                           '../models/sac_model.pth')
