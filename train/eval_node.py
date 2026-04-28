@@ -346,7 +346,7 @@ def main():
 
             env_action = np.array([[steering, target_speed]], dtype=np.float32)
             next_obs_raw, _, done, _ = env.step(env_action)
-
+            env.render()
             metrics.update(
                 next_obs_raw,
                 target_speed,

@@ -677,7 +677,8 @@ def main():
             )
 
             next_obs_raw, _, done, _ = env.step(np.array([env_action]))
-            env.render()
+            #랜더링 화면 송출
+            #env.render()
             # 진행 상황 기록
             progress_idx, progress_pct, progress_score = get_wp_progress(
                 next_obs_raw, progress_reference_line,
