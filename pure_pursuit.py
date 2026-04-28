@@ -6,28 +6,29 @@ Pure Pursuit 경로 추종 컨트롤러
 입력: 현재 차량 상태 (x, y, heading) + 웨이포인트 배열
 출력: 조향각 (rad), 속도 (m/s)
 
-waypoint_loader.py 와 함께 사용
+속도·조향·lookahead 등 모든 파라미터는 config.py의
+PURE_PURSUIT_CONFIG, SPEED_MIN, SPEED_MAX 에서 관리
 """
 
+import os
+import sys
+
 import numpy as np
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from config import PURE_PURSUIT_CONFIG, SPEED_MIN, SPEED_MAX
 from waypoint_loader import get_nearest_waypoint_idx, get_lookahead_point
 
 
-# ── 차량 파라미터 (F1tenth 기본값) ────────────────────────────────────────────
-WHEELBASE = 0.3302   # 축거 (lf + lr = 0.15875 + 0.17145)
-
-# ── Pure Pursuit 파라미터 ─────────────────────────────────────────────────────
-MIN_LOOKAHEAD   = 0.5    # 최소 lookahead 거리 (m)
-MAX_LOOKAHEAD   = 2.0    # 최대 lookahead 거리 (m)
-LOOKAHEAD_GAIN  = 0.3    # 속도 대비 lookahead 비율 (s)
-
-# ── 속도 파라미터 ─────────────────────────────────────────────────────────────
-MAX_SPEED       = 3.0    # 최대 속도 (m/s)
-MIN_SPEED       = 0.5    # 최소 속도 (m/s)
-CURVATURE_GAIN  = 2.0    # 곡률 대비 감속 비율
-
-# ── 조향 제한 ─────────────────────────────────────────────────────────────────
-MAX_STEERING    = 0.4189  # 최대 조향각 (rad, 약 24도)
+# ── config에서 기본값 로드 ────────────────────────────────────────────────────
+WHEELBASE      = PURE_PURSUIT_CONFIG['wheelbase']
+MIN_LOOKAHEAD  = PURE_PURSUIT_CONFIG['min_lookahead']
+MAX_LOOKAHEAD  = PURE_PURSUIT_CONFIG['max_lookahead']
+LOOKAHEAD_GAIN = PURE_PURSUIT_CONFIG['lookahead_gain']
+MAX_SPEED      = SPEED_MAX
+MIN_SPEED      = SPEED_MIN
+CURVATURE_GAIN = PURE_PURSUIT_CONFIG['curvature_gain']
+MAX_STEERING   = PURE_PURSUIT_CONFIG['max_steering']
 
 
 class PurePursuitController:
@@ -40,14 +41,14 @@ class PurePursuitController:
     """
 
     def __init__(self,
-                 wheelbase:     float = WHEELBASE,
-                 min_lookahead: float = MIN_LOOKAHEAD,
-                 max_lookahead: float = MAX_LOOKAHEAD,
+                 wheelbase:      float = WHEELBASE,
+                 min_lookahead:  float = MIN_LOOKAHEAD,
+                 max_lookahead:  float = MAX_LOOKAHEAD,
                  lookahead_gain: float = LOOKAHEAD_GAIN,
-                 max_speed:     float = MAX_SPEED,
-                 min_speed:     float = MIN_SPEED,
+                 max_speed:      float = MAX_SPEED,
+                 min_speed:      float = MIN_SPEED,
                  curvature_gain: float = CURVATURE_GAIN,
-                 max_steering:  float = MAX_STEERING):
+                 max_steering:   float = MAX_STEERING):
 
         self.wheelbase      = wheelbase
         self.min_lookahead  = min_lookahead
@@ -91,29 +92,36 @@ class PurePursuitController:
         lookahead_dist = self._calc_lookahead(abs(current_speed))
 
         # 3) 목표점 찾기
-        target_point, target_idx = get_lookahead_point(
+        target_point, _ = get_lookahead_point(
             position, waypoints, lookahead_dist, self._nearest_idx
         )
 
         # 4) 조향각 계산
-        steering = self._calc_steering(x, y, heading, target_point,
-                                        lookahead_dist)
+        raw_steering = self._calc_steering(x, y, heading, target_point,
+                                           lookahead_dist)
 
-        # 5) 목표 속도 계산 (곡률 기반)
-        target_speed = self._calc_speed(waypoints, self._nearest_idx,
-                                         steering)
+        # 5) 조향각 스무딩 먼저 수행
+        #    → 스무딩된 값으로 속도를 계산해야 코너 진입 전 과가속을 막을 수 있음
+        steering = self._smooth_steering(raw_steering)
 
-        # 6) 조향각 스무딩 (급격한 변화 억제)
-        steering = self._smooth_steering(steering)
+        # 6) 스무딩된 조향각 기반으로 목표 속도 계산
+        target_speed = self._calc_speed(
+            waypoints,
+            self._nearest_idx,
+            steering,
+            abs(current_speed)
+        )
 
         self._prev_steering = steering
 
         return steering, target_speed
 
+    # ── 내부 계산 ─────────────────────────────────────────────────────────────
+
     def _calc_lookahead(self, speed: float) -> float:
         """속도 비례 lookahead 거리 계산"""
         ld = self.min_lookahead + self.lookahead_gain * speed
-        return np.clip(ld, self.min_lookahead, self.max_lookahead)
+        return float(np.clip(ld, self.min_lookahead, self.max_lookahead))
 
     def _calc_steering(self,
                        x: float,
@@ -127,95 +135,106 @@ class PurePursuitController:
         steering = arctan(2 * L * sin(alpha) / ld)
         L: 축거, alpha: 목표점까지 각도, ld: lookahead 거리
         """
-        # 목표점까지의 벡터
         dx = target[0] - x
         dy = target[1] - y
 
-        # 목표점의 절대 각도
         target_angle = np.arctan2(dy, dx)
-
-        # 차량 기준 상대 각도
         alpha = _normalize_angle(target_angle - heading)
 
-        # 실제 거리 (lookahead_dist 대신 실측 사용)
         actual_dist = np.sqrt(dx**2 + dy**2)
         if actual_dist < 1e-6:
             return 0.0
 
-        # Pure Pursuit 공식
         steering = np.arctan2(2.0 * self.wheelbase * np.sin(alpha),
                               actual_dist)
 
-        # 조향각 제한
-        return np.clip(steering, -self.max_steering, self.max_steering)
+        return float(np.clip(steering, -self.max_steering, self.max_steering))
 
     def _calc_speed(self,
-                    waypoints: np.ndarray,
-                    nearest_idx: int,
-                    steering: float) -> float:
+                waypoints: np.ndarray,
+                nearest_idx: int,
+                steering: float,
+                current_speed: float) -> float:
         """
-        곡률 기반 속도 계산
-        - 조향각이 크면 (커브) → 감속
-        - 조향각이 작으면 (직선) → 가속
+        속도 계산 전용 로직
+    
+        조향용 lookahead와 분리해서,
+        속도는 더 먼 전방 곡률을 보고 미리 감속한다.
         """
-        # 조향각 기반 감속
-        abs_steering = abs(steering)
-        steering_ratio = abs_steering / self.max_steering   # 0~1
-
-        # 곡률도 추가 참고 (앞쪽 경로의 곡률)
-        curvature = self._estimate_curvature(waypoints, nearest_idx)
+        base_window  = PURE_PURSUIT_CONFIG['lookahead_window_base']
+        speed_window = PURE_PURSUIT_CONFIG['lookahead_window_speed_scale']
+    
+        # 현재 속도가 빠를수록 더 멀리 보고 감속
+        window = int(base_window + speed_window * abs(current_speed))
+    
+        curvature = self._estimate_max_lookahead_curvature(
+            waypoints, nearest_idx, window
+        )
+    
+        # 1) 전방 곡률 기반 감속
         curvature_factor = 1.0 / (1.0 + self.curvature_gain * curvature)
+    
+        # 2) 현재 조향각 기반 감속
+        #    코너를 도는 중인데 곡률이 낮아졌다고 바로 재가속하는 것을 방지
+        steering_ratio = abs(steering) / self.max_steering
+        steering_gain = PURE_PURSUIT_CONFIG.get('steering_speed_gain', 2.0)
+        steering_factor = 1.0 / (1.0 + steering_gain * steering_ratio)
+    
+        speed = self.max_speed * curvature_factor * steering_factor
+    
+        return float(np.clip(speed, self.min_speed, self.max_speed))
 
-        # 최종 속도: 곡률과 조향각 모두 고려
-        speed = self.max_speed * curvature_factor * (1.0 - 0.5 * steering_ratio)
-
-        return np.clip(speed, self.min_speed, self.max_speed)
-
-    def _estimate_curvature(self,
-                            waypoints: np.ndarray,
-                            idx: int,
-                            window: int = 10) -> float:
+    def _estimate_max_lookahead_curvature(self,
+                                      waypoints: np.ndarray,
+                                      nearest_idx: int,
+                                      window: int) -> float:
         """
-        앞쪽 웨이포인트들의 곡률 추정
-        세 점으로 외접원의 곡률을 계산
+        속도 감속용 전방 최대 곡률 계산
+    
+        window는 길게 가져가되,
+        sample step은 작게 고정해서 멀리 있는 커브도 촘촘하게 감지한다.
         """
         N = len(waypoints)
         if N < 3:
             return 0.0
+    
+        curvatures = []
+    
+        # 기존처럼 window // 8로 두면 window가 커질수록 샘플링이 거칠어짐
+        step = PURE_PURSUIT_CONFIG.get('curvature_sample_step', 2)
+    
+        for offset in range(0, window, 1):
+            i0 = (nearest_idx + offset) % N
+            i1 = (nearest_idx + offset + step) % N
+            i2 = (nearest_idx + offset + step * 2) % N
+    
+            p0, p1, p2 = waypoints[i0], waypoints[i1], waypoints[i2]
+    
+            a = np.linalg.norm(p1 - p0)
+            b = np.linalg.norm(p2 - p1)
+            c = np.linalg.norm(p2 - p0)
+    
+            if a < 1e-6 or b < 1e-6 or c < 1e-6:
+                continue
+    
+            area = abs(
+                (p1[0] - p0[0]) * (p2[1] - p0[1])
+                - (p2[0] - p0[0]) * (p1[1] - p0[1])
+            ) / 2.0
+    
+            curvatures.append(4.0 * area / (a * b * c))
+    
+        return float(np.max(curvatures)) if curvatures else 0.0
 
-        # 현재, 중간, 먼 점 선택
-        i0 = idx
-        i1 = (idx + window // 2) % N
-        i2 = (idx + window) % N
-
-        p0 = waypoints[i0]
-        p1 = waypoints[i1]
-        p2 = waypoints[i2]
-
-        # 세 점으로 곡률 계산 (Menger curvature)
-        # k = 4 * area / (|a| * |b| * |c|)
-        a = np.linalg.norm(p1 - p0)
-        b = np.linalg.norm(p2 - p1)
-        c = np.linalg.norm(p2 - p0)
-
-        if a < 1e-6 or b < 1e-6 or c < 1e-6:
-            return 0.0
-
-        # 삼각형 넓이 (외적)
-        area = abs((p1[0] - p0[0]) * (p2[1] - p0[1]) -
-                   (p2[0] - p0[0]) * (p1[1] - p0[1])) / 2.0
-
-        curvature = 4.0 * area / (a * b * c)
-        return curvature
-
-    def _smooth_steering(self, steering: float,
-                         alpha: float = 0.3) -> float:
+    def _smooth_steering(self,
+                         steering: float,
+                         alpha: float = PURE_PURSUIT_CONFIG['smooth_alpha']) -> float:
         """
         조향각 스무딩 (이전 값과 가중 평균)
         alpha가 작을수록 부드럽게 변화
         """
-        smoothed = alpha * steering + (1 - alpha) * self._prev_steering
-        return np.clip(smoothed, -self.max_steering, self.max_steering)
+        smoothed = alpha * steering + (1.0 - alpha) * self._prev_steering
+        return float(np.clip(smoothed, -self.max_steering, self.max_steering))
 
     @property
     def nearest_idx(self) -> int:
@@ -244,8 +263,7 @@ if __name__ == '__main__':
 
     controller = PurePursuitController()
 
-    # 시뮬레이션: 차량이 트랙을 따라가는지 확인
-    x, y, heading = 5.0, 0.0, np.pi / 2   # 시작: (5,0), 위를 향함
+    x, y, heading = 5.0, 0.0, np.pi / 2
     speed = 1.0
     dt = 0.01
 
@@ -256,16 +274,14 @@ if __name__ == '__main__':
     errors = []
     for step in range(2000):
         steering, target_speed = controller.compute(x, y, heading, speed,
-                                                     waypoints)
+                                                    waypoints)
 
-        # 간단한 자전거 모델로 차량 업데이트
-        speed = target_speed
-        x       += speed * np.cos(heading) * dt
-        y       += speed * np.sin(heading) * dt
+        speed   = target_speed
+        x      += speed * np.cos(heading) * dt
+        y      += speed * np.sin(heading) * dt
         heading += (speed / WHEELBASE) * np.tan(steering) * dt
         heading  = _normalize_angle(heading)
 
-        # 트랙 중심과의 거리 오차
         dist_from_center = abs(np.sqrt(x**2 + y**2) - radius)
         errors.append(dist_from_center)
 

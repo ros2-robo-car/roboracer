@@ -363,7 +363,7 @@ def make_warmup_action(
     # 선택된 라인에 대해 Pure Pursuit으로 속도 계산
     waypoints = waypoints_lines[line_idx]
     _, pp_speed = controller.compute(x, y, heading, current_speed, waypoints)
-    pp_speed = min(pp_speed, 1.5)
+    pp_speed = min(pp_speed, 5)
 
     # SAC action 형태로 변환 [-1, 1]
     if num_lines > 1:
