@@ -245,11 +245,11 @@ class PurePursuitController:
 # ── 유틸리티 ──────────────────────────────────────────────────────────────────
 
 def _normalize_angle(angle: float) -> float:
-    """각도를 -pi ~ pi 범위로 정규화"""
-    while angle > np.pi:
+    if not np.isfinite(angle):
+        return 0.0
+    angle = angle % (2.0 * np.pi)
+    if angle > np.pi:
         angle -= 2.0 * np.pi
-    while angle < -np.pi:
-        angle += 2.0 * np.pi
     return angle
 
 

@@ -125,7 +125,7 @@ class EvalMetrics:
             position,
             self.reference_waypoints,
         )
-        progress_pct = progress_idx / self.reference_len * 100.0
+        progress_pct = (progress_idx+1) / self.reference_len * 100.0
         progress_score = self.laps_completed * self.reference_len + progress_idx
 
         if progress_score > self.best_progress_score:
@@ -156,7 +156,7 @@ class EvalMetrics:
         print(f'라인 전환 횟수: {self.line_switches}')
         print(f'총 스텝       : {self.total_steps}')
         print(
-            f'wp 진행       : {self.best_progress_idx}/{self.reference_len} '
+            f'wp 진행       : {self.best_progress_idx+1}/{self.reference_len} '
             f'({self.best_progress_pct:.1f}%)'
         )
         print(f'{"─" * 45}\n')
@@ -346,7 +346,7 @@ def main():
 
             env_action = np.array([[steering, target_speed]], dtype=np.float32)
             next_obs_raw, _, done, _ = env.step(env_action)
-            env.render()
+            #env.render()
             metrics.update(
                 next_obs_raw,
                 target_speed,
