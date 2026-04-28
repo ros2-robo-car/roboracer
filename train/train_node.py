@@ -1,3 +1,10 @@
+"""
+train_node.py (라인 선택 버전)
+──────────────────────────────
+SAC가 라인을 선택하고, Pure Pursuit이 추종하는 구조로 학습
+설정은 config.py에서 관리
+"""
+
 import os
 import sys
 import numpy as np
@@ -10,6 +17,7 @@ import gym
 import f110_gym
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+<<<<<<< Updated upstream
 from sac_model import SAC
 
 
@@ -152,115 +160,206 @@ def preprocess_obs(obs: dict) -> np.ndarray:
 
 def get_obs_dim() -> int:
     return OBS_CONFIG['lidar_size']
+=======
+from config import (
+    ENV_CONFIG, OBS_CONFIG, LINE_CONFIG, MODEL_CONFIG, TRAIN_CONFIG,
+    SPEED_MIN, SPEED_MAX, MODEL_SAVE_PATH,
+)
+from sac_model import SAC, build_observation, get_obs_dim
+from waypoint_loader import load_waypoints, get_nearest_waypoint_idx
+from pure_pursuit import PurePursuitController
+
+
+# ── 웨이포인트 로드 ───────────────────────────────────────────────────────────
+def load_racing_lines() -> dict:
+    csv_path = LINE_CONFIG['centerline_csv']
+    if os.path.exists(csv_path):
+        print(f'centerline CSV 로드: {csv_path}')
+        wp = load_waypoints(centerline_path=csv_path,
+                            num_lines=LINE_CONFIG['num_lines'],
+                            line_spacing=LINE_CONFIG['line_spacing'])
+    else:
+        print(f'CSV 없음 → 맵 이미지에서 centerline 추출')
+        wp = load_waypoints(map_path=LINE_CONFIG['map_path'],
+                            map_ext=LINE_CONFIG['map_ext'],
+                            num_lines=LINE_CONFIG['num_lines'],
+                            line_spacing=LINE_CONFIG['line_spacing'])
+    print(f'라인 {len(wp["lines"])}개 생성 완료 (점 수: {len(wp["lines"][0])})')
+    return wp
+
+
+# ── 전처리 ────────────────────────────────────────────────────────────────────
+def preprocess_lidar(obs_raw: dict) -> np.ndarray:
+    lidar = obs_raw['scans'][0].astype(np.float32)
+    lidar = np.where(np.isfinite(lidar), lidar, OBS_CONFIG['lidar_range_max'])
+    lidar = np.clip(lidar, OBS_CONFIG['lidar_range_min'], OBS_CONFIG['lidar_range_max'])
+    lidar = ((lidar - OBS_CONFIG['lidar_range_min']) /
+             (OBS_CONFIG['lidar_range_max'] - OBS_CONFIG['lidar_range_min']))
+    size = OBS_CONFIG['lidar_size']
+    step = max(1, len(lidar) // size)
+    lidar = lidar[::step][:size]
+    if len(lidar) < size:
+        lidar = np.pad(lidar, (0, size - len(lidar)), constant_values=1.0)
+    return lidar
+
+
+def preprocess_obs(obs_raw, waypoints_lines, num_lines):
+    lidar = preprocess_lidar(obs_raw)
+    position = np.array([float(obs_raw['poses_x'][0]), float(obs_raw['poses_y'][0])])
+    heading = float(obs_raw['poses_theta'][0])
+    speed = float(obs_raw['linear_vels_x'][0])
+    return build_observation(lidar, position, heading, speed, waypoints_lines, num_lines)
+
+
+# ── action → 환경 제어 ────────────────────────────────────────────────────────
+def action_to_env(action, obs_raw, model, waypoints_lines, controller):
+    line_idx = model.action_to_line_index(action)
+    waypoints = waypoints_lines[line_idx]
+    x, y = float(obs_raw['poses_x'][0]), float(obs_raw['poses_y'][0])
+    heading = float(obs_raw['poses_theta'][0])
+    speed = float(obs_raw['linear_vels_x'][0])
+    steering, pp_speed = controller.compute(x, y, heading, speed, waypoints)
+    sac_speed = model.action_to_speed(action, SPEED_MIN, SPEED_MAX)
+    return np.array([steering, min(sac_speed, pp_speed)], dtype=np.float32)
+
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+def compute_reward(obs_raw, action, model, waypoints_lines,
+                   prev_pos, prev_lap, prev_line_idx, prev_nearest_idx):
+    x, y = float(obs_raw['poses_x'][0]), float(obs_raw['poses_y'][0])
+    speed = float(obs_raw['linear_vels_x'][0])
+    collision = bool(obs_raw['collisions'][0])
+    lap_count = int(obs_raw['lap_counts'][0])
+
+    line_idx = model.action_to_line_index(action)
+    waypoints = waypoints_lines[line_idx]
+    position = np.array([x, y])
+    nearest_idx = get_nearest_waypoint_idx(position, waypoints)
+    nearest_dist = np.linalg.norm(waypoints[nearest_idx] - position)
+
+    if collision:
+        return -10.0, (x, y), lap_count, line_idx, nearest_idx
+
+    N = len(waypoints)
+    progress = (nearest_idx - prev_nearest_idx) % N
+    if progress > N // 2:
+        progress = 0
+
+    reward = (progress * 1.0
+              + (abs(speed) / SPEED_MAX) * 0.5
+              + (100.0 if lap_count > prev_lap else 0.0)
+              - 0.5 * nearest_dist
+              + (-0.3 if line_idx != prev_line_idx else 0.0))
+
+    return reward, (x, y), lap_count, line_idx, nearest_idx
+
+
+# ── Warmup ────────────────────────────────────────────────────────────────────
+def simple_policy(obs_raw):
+    scan = np.array(obs_raw['scans'][0], dtype=np.float32)
+    scan = np.where(np.isfinite(scan), scan, 0.0)
+    n = len(scan)
+    front_scan = scan[n // 4: 3 * n // 4]
+    max_idx = int(np.argmax(front_scan))
+    mid = len(front_scan) // 2
+    steer = float(np.clip((max_idx - mid) / mid * 0.4, -0.4, 0.4))
+    front_dist = float(np.mean(front_scan[max(0, mid - 10):mid + 10]))
+    speed = float(np.clip(front_dist * 0.8, 1.0, 5.0))
+    return np.array([steer, speed], dtype=np.float32)
+
+
+def warmup_action_to_sac(obs_raw, waypoints_lines, num_lines):
+    x, y = float(obs_raw['poses_x'][0]), float(obs_raw['poses_y'][0])
+    position = np.array([x, y])
+    min_dist, best_line = float('inf'), num_lines // 2
+    for i, wp in enumerate(waypoints_lines):
+        idx = get_nearest_waypoint_idx(position, wp)
+        dist = np.linalg.norm(wp[idx] - position)
+        if dist < min_dist:
+            min_dist, best_line = dist, i
+    line_val = (best_line / (num_lines - 1)) * 2.0 - 1.0
+    env_action = simple_policy(obs_raw)
+    speed_val = float(np.clip(((env_action[1] - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)) * 2.0 - 1.0, -1.0, 1.0))
+    return np.array([line_val, speed_val], dtype=np.float32)
+
+
+# ── 유틸리티 ──────────────────────────────────────────────────────────────────
+def is_valid_obs(obs):
+    return bool(np.isfinite(obs).all())
+
+def build_model(obs_dim):
+    return SAC(obs_dim, MODEL_CONFIG['action_dim'],
+               MODEL_CONFIG['hidden_dims'], MODEL_CONFIG['num_lines'])
+>>>>>>> Stashed changes
 
 
 # ── 리플레이 버퍼 ─────────────────────────────────────────────────────────────
 class ReplayBuffer:
-    def __init__(self, max_size: int):
+    def __init__(self, max_size):
         self.buffer = deque(maxlen=max_size)
-
     def push(self, obs, action, reward, next_obs, done):
         self.buffer.append((obs, action, reward, next_obs, done))
-
-    def sample(self, batch_size: int):
+    def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         obs, action, reward, next_obs, done = zip(*batch)
-        return (
-            torch.FloatTensor(np.array(obs)),
-            torch.FloatTensor(np.array(action)),
-            torch.FloatTensor(np.array(reward)).unsqueeze(1),
-            torch.FloatTensor(np.array(next_obs)),
-            torch.FloatTensor(np.array(done)).unsqueeze(1),
-        )
-
+        return (torch.FloatTensor(np.array(obs)),
+                torch.FloatTensor(np.array(action)),
+                torch.FloatTensor(np.array(reward)).unsqueeze(1),
+                torch.FloatTensor(np.array(next_obs)),
+                torch.FloatTensor(np.array(done)).unsqueeze(1))
     def __len__(self):
         return len(self.buffer)
 
 
-# ── 학습 클래스 ───────────────────────────────────────────────────────────────
+# ── Trainer ───────────────────────────────────────────────────────────────────
 class Trainer:
-    def __init__(self, obs_dim: int):
+    def __init__(self, obs_dim):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f'device    : {self.device}')
-        print(f'model     : {MODEL_CONFIG["type"]}')
-        print(f'obs_dim   : {obs_dim}')
-        print(f'action_dim: {MODEL_CONFIG["action_dim"]}')
-
-        self.model  = build_model(obs_dim).to(self.device)
+        print(f'device: {self.device} | obs_dim: {obs_dim} | num_lines: {MODEL_CONFIG["num_lines"]}')
+        self.model = build_model(obs_dim).to(self.device)
         self.buffer = ReplayBuffer(TRAIN_CONFIG['buffer_size'])
+        self._init_optimizers()
 
-        if MODEL_CONFIG['type'] == 'SAC':
-            self._init_sac_optimizers()
-
-    def _init_sac_optimizers(self):
-        self.actor_optimizer   = optim.Adam(
-            self.model.actor.parameters(),   lr=TRAIN_CONFIG['lr_actor'])
-        self.critic1_optimizer = optim.Adam(
-            self.model.critic1.parameters(), lr=TRAIN_CONFIG['lr_critic'])
-        self.critic2_optimizer = optim.Adam(
-            self.model.critic2.parameters(), lr=TRAIN_CONFIG['lr_critic'])
-
+    def _init_optimizers(self):
+        self.actor_opt = optim.Adam(self.model.actor.parameters(), lr=TRAIN_CONFIG['lr_actor'])
+        self.critic1_opt = optim.Adam(self.model.critic1.parameters(), lr=TRAIN_CONFIG['lr_critic'])
+        self.critic2_opt = optim.Adam(self.model.critic2.parameters(), lr=TRAIN_CONFIG['lr_critic'])
         self.target_entropy = -MODEL_CONFIG['action_dim'] * 0.5
-        self.log_alpha       = torch.zeros(1, requires_grad=True, device=self.device)
-        self.alpha           = self.log_alpha.exp()
-        self.alpha_optimizer = optim.Adam(
-            [self.log_alpha], lr=TRAIN_CONFIG['lr_alpha'])
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+        self.alpha = self.log_alpha.exp()
+        self.alpha_opt = optim.Adam([self.log_alpha], lr=TRAIN_CONFIG['lr_alpha'])
 
     def update(self):
         if len(self.buffer) < TRAIN_CONFIG['batch_size']:
             return
-
-        obs, action, reward, next_obs, done = self.buffer.sample(
-            TRAIN_CONFIG['batch_size'])
-        obs      = obs.to(self.device)
-        action   = action.to(self.device)
-        reward   = reward.to(self.device)
-        next_obs = next_obs.to(self.device)
-        done     = done.to(self.device)
-
-        gamma = TRAIN_CONFIG['gamma']
-        tau   = TRAIN_CONFIG['tau']
+        obs, action, reward, next_obs, done = self.buffer.sample(TRAIN_CONFIG['batch_size'])
+        obs, action, reward = obs.to(self.device), action.to(self.device), reward.to(self.device)
+        next_obs, done = next_obs.to(self.device), done.to(self.device)
+        gamma, tau = TRAIN_CONFIG['gamma'], TRAIN_CONFIG['tau']
 
         with torch.no_grad():
-            next_action, next_log_prob = self.model.actor.sample(next_obs)
-            target_q1 = self.model.target_critic1(next_obs, next_action)
-            target_q2 = self.model.target_critic2(next_obs, next_action)
-            target_q  = (torch.min(target_q1, target_q2)
-                         - self.alpha * next_log_prob)
-            target_q  = reward + (1 - done) * gamma * target_q
+            na, nlp = self.model.actor.sample(next_obs)
+            tq = torch.min(self.model.target_critic1(next_obs, na),
+                           self.model.target_critic2(next_obs, na)) - self.alpha * nlp
+            tq = reward + (1 - done) * gamma * tq
 
-        for optimizer, critic in [
-            (self.critic1_optimizer, self.model.critic1),
-            (self.critic2_optimizer, self.model.critic2),
-        ]:
-            loss = F.mse_loss(critic(obs, action), target_q)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        for opt, critic in [(self.critic1_opt, self.model.critic1), (self.critic2_opt, self.model.critic2)]:
+            loss = F.mse_loss(critic(obs, action), tq)
+            opt.zero_grad(); loss.backward(); opt.step()
 
-        new_action, log_prob = self.model.actor.sample(obs)
-        q1         = self.model.critic1(obs, new_action)
-        q2         = self.model.critic2(obs, new_action)
-        actor_loss = (self.alpha * log_prob - torch.min(q1, q2)).mean()
+        new_a, lp = self.model.actor.sample(obs)
+        actor_loss = (self.alpha * lp - torch.min(self.model.critic1(obs, new_a), self.model.critic2(obs, new_a))).mean()
+        self.actor_opt.zero_grad(); actor_loss.backward(); self.actor_opt.step()
 
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        alpha_loss = -(self.log_alpha *
-                       (log_prob + self.target_entropy).detach()).mean()
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
+        alpha_loss = -(self.log_alpha * (lp + self.target_entropy).detach()).mean()
+        self.alpha_opt.zero_grad(); alpha_loss.backward(); self.alpha_opt.step()
         self.alpha = self.log_alpha.exp()
 
-        for critic, target in [
-            (self.model.critic1, self.model.target_critic1),
-            (self.model.critic2, self.model.target_critic2),
-        ]:
-            for p, tp in zip(critic.parameters(), target.parameters()):
+        for c, tc in [(self.model.critic1, self.model.target_critic1), (self.model.critic2, self.model.target_critic2)]:
+            for p, tp in zip(c.parameters(), tc.parameters()):
                 tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
 
+<<<<<<< Updated upstream
     def evaluate(self, env, n_episodes: int = 5) -> float:
         total_reward = 0.0
         init_poses   = np.array([[0.0, 0.0, np.pi / 2]])
@@ -279,28 +378,54 @@ class Trainer:
                 obs          = preprocess_obs(next_obs)
                 total_reward += reward
                 if done:
+=======
+    def evaluate(self, env, waypoints_lines, controller, n_episodes=3):
+        total_reward, init_poses = 0.0, np.array([[0.0, 0.0, np.pi / 2]])
+        num_lines = MODEL_CONFIG['num_lines']
+        for _ in range(n_episodes):
+            obs_raw, _, _, _ = env.reset(poses=init_poses)
+            obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
+            prev_pos = (float(obs_raw['poses_x'][0]), float(obs_raw['poses_y'][0]))
+            prev_lap, prev_line, prev_near = 0, num_lines // 2, 0
+            for _ in range(TRAIN_CONFIG['max_steps']):
+                action = self.model.select_action(obs, training=False)
+                env_action = action_to_env(action, obs_raw, self.model, waypoints_lines, controller)
+                next_obs_raw, _, done, _ = env.step(np.array([env_action]))
+                reward, prev_pos, prev_lap, prev_line, prev_near = compute_reward(
+                    next_obs_raw, action, self.model, waypoints_lines, prev_pos, prev_lap, prev_line, prev_near)
+                obs = preprocess_obs(next_obs_raw, waypoints_lines, num_lines)
+                obs_raw = next_obs_raw
+                total_reward += reward
+                if done or int(next_obs_raw['lap_counts'][0]) >= 2:
+>>>>>>> Stashed changes
                     break
         return total_reward / n_episodes
 
-    def save(self, path: str):
+    def save(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save({
-            'model_state' : self.model.state_dict(),
-            'model_config': MODEL_CONFIG,
-            'obs_config'  : OBS_CONFIG,
-        }, path)
+        torch.save({'model_state': self.model.state_dict(), 'model_config': MODEL_CONFIG,
+                     'obs_config': OBS_CONFIG, 'line_config': LINE_CONFIG}, path)
         print(f'모델 저장: {path}')
 
-    def load(self, path: str):
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state'])
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt['model_state'])
         print(f'모델 로드: {path}')
 
 
-# ── 메인 학습 루프 ────────────────────────────────────────────────────────────
+# ── 메인 ──────────────────────────────────────────────────────────────────────
 def main():
     env = gym.make('f110_gym:f110-v0', **ENV_CONFIG)
+    num_lines = MODEL_CONFIG['num_lines']
+    wp = load_racing_lines()
+    waypoints_lines = wp['lines']
+    controller = PurePursuitController(max_speed=SPEED_MAX, min_speed=SPEED_MIN)
+    obs_dim = get_obs_dim(OBS_CONFIG['lidar_size'], num_lines)
+    trainer = Trainer(obs_dim)
+    best_reward, total_steps = -float('inf'), 0
+    init_poses = np.array([[0.0, 0.0, np.pi / 2]])
 
+<<<<<<< Updated upstream
     obs_dim     = get_obs_dim()
     trainer     = Trainer(obs_dim)
     best_reward = -float('inf')
@@ -317,10 +442,20 @@ def main():
         obs, _, _, _ = env.reset(poses=init_poses)
         obs          = preprocess_obs(obs)
         episode_reward = 0.0
+=======
+    print(f'\n학습 시작 | map: {ENV_CONFIG["map"]} | obs_dim: {obs_dim} | lines: {num_lines}\n')
+
+    for episode in range(TRAIN_CONFIG['max_episodes']):
+        obs_raw, _, _, _ = env.reset(poses=init_poses)
+        obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
+        ep_reward, prev_lap = 0.0, 0
+        prev_pos = (float(obs_raw['poses_x'][0]), float(obs_raw['poses_y'][0]))
+        prev_line_idx, prev_nearest, collisions, speeds = num_lines // 2, 0, 0, []
+>>>>>>> Stashed changes
 
         for _ in range(TRAIN_CONFIG['max_steps']):
-
             if total_steps < TRAIN_CONFIG['warmup_steps']:
+<<<<<<< Updated upstream
                 action = np.array([
                     np.random.uniform(-1.0, 1.0),
                     np.random.uniform(-1.0, 1.0),
@@ -357,19 +492,45 @@ def main():
         print(f'episode {episode:5d} | '
               f'reward: {episode_reward:8.2f} | '
               f'steps: {total_steps}')
+=======
+                action = warmup_action_to_sac(obs_raw, waypoints_lines, num_lines)
+                env_action = simple_policy(obs_raw)
+            else:
+                action = trainer.model.select_action(obs, training=True)
+                action = np.clip(action + np.random.normal(0, 0.1, size=action.shape), -1.0, 1.0)
+                env_action = action_to_env(action, obs_raw, trainer.model, waypoints_lines, controller)
+
+            next_obs_raw, _, done, _ = env.step(np.array([env_action]))
+            if bool(next_obs_raw['collisions'][0]): collisions += 1
+            speeds.append(abs(float(next_obs_raw['linear_vels_x'][0])))
+
+            reward, prev_pos, prev_lap, prev_line_idx, prev_nearest = compute_reward(
+                next_obs_raw, action, trainer.model, waypoints_lines, prev_pos, prev_lap, prev_line_idx, prev_nearest)
+
+            next_obs = preprocess_obs(next_obs_raw, waypoints_lines, num_lines)
+            if is_valid_obs(obs) and is_valid_obs(next_obs):
+                trainer.buffer.push(obs, action, reward, next_obs, float(done))
+
+            obs, obs_raw, ep_reward, total_steps = next_obs, next_obs_raw, ep_reward + float(reward), total_steps + 1
+            if total_steps >= TRAIN_CONFIG['warmup_steps']:
+                trainer.update()
+            if done or int(next_obs_raw['lap_counts'][0]) >= 2:
+                break
+
+        print(f'ep {episode:5d} | reward: {ep_reward:8.2f} | lap: {prev_lap} | '
+              f'speed: {np.mean(speeds) if speeds else 0:.2f} | crash: {collisions} | '
+              f'line: {prev_line_idx} | steps: {total_steps}')
+>>>>>>> Stashed changes
 
         if episode % TRAIN_CONFIG['eval_interval'] == 0 and episode > 0:
-            eval_reward = trainer.evaluate(env)
-            print(f'[평가] episode {episode} | eval reward: {eval_reward:.2f}')
-
-            if eval_reward >= best_reward:
-                best_reward = eval_reward
+            ev = trainer.evaluate(env, waypoints_lines, controller)
+            print(f'[평가] ep {episode} | eval reward: {ev:.2f}')
+            if ev >= best_reward:
+                best_reward = ev
                 trainer.save(MODEL_SAVE_PATH)
-                print(f'최고 성능 갱신: {best_reward:.2f}')
 
     env.close()
     print('\n학습 완료')
-
 
 if __name__ == '__main__':
     main()

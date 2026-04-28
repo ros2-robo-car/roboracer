@@ -1,98 +1,76 @@
+"""
+quantize_model.py (라인 선택 버전)
+──────────────────────────────────
+FP32 → INT8 동적 양자화 및 비교 평가
+설정은 config.py에서 관리
+"""
+
 import os
 import sys
 import time
 import numpy as np
 import torch
-import torch.quantization as quant
 import gym
 import f110_gym
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from sac_model import SAC
-from train_node import (
-    ENV_CONFIG, OBS_CONFIG, MODEL_CONFIG,
-    preprocess_obs, get_obs_dim, build_model
+from config import (
+    ENV_CONFIG, OBS_CONFIG, LINE_CONFIG, MODEL_CONFIG,
+    SPEED_MIN, SPEED_MAX, MODEL_SAVE_PATH, QUANTIZED_PATH,
+    QUANTIZE_EPISODES, EVAL_MAX_STEPS,
 )
-from eval_node import EvalMetrics
-
-MODEL_PATH     = os.path.join(os.path.dirname(__file__), '../models/sac_model.pth')
-QUANTIZED_PATH = os.path.join(os.path.dirname(__file__), '../models/sac_model_quantized.pth')
-N_EPISODES     = 5
-MAX_STEPS      = 1000
-
-
-def load_fp32_model(path):
-    """FP32 원본 모델 로드"""
-    checkpoint = torch.load(path, map_location='cpu')
-    obs_dim = get_obs_dim()
-    model = build_model(obs_dim)
-
-    if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
-        model.load_state_dict(checkpoint['model_state'])
-    else:
-        model.load_state_dict(checkpoint)
-
-    model.eval()
-    return model
+from sac_model import SAC, get_obs_dim
+from pure_pursuit import PurePursuitController
+from eval_node import (
+    EvalMetrics, preprocess_obs, load_racing_lines, load_model,
+)
 
 
 def quantize_dynamic(model):
-    """동적 양자화 (Linear 레이어 대상, FP32 → INT8)"""
-    quantized = torch.quantization.quantize_dynamic(
-        model,
-        {torch.nn.Linear},  # Linear 레이어만 양자화
-        dtype=torch.qint8
-    )
-    return quantized
+    return torch.quantization.quantize_dynamic(
+        model, {torch.nn.Linear}, dtype=torch.qint8)
 
 
-def evaluate_model(model, env, label="모델"):
-    """모델 평가 + 추론 시간 측정"""
+def evaluate_model(model, env, waypoints_lines, controller, num_lines, label):
     init_poses = np.array([[0.0, 0.0, np.pi / 2]])
-    all_results = []
-    inference_times = []
+    all_results, inference_times = [], []
 
-    for episode in range(N_EPISODES):
+    for episode in range(QUANTIZE_EPISODES):
         metrics = EvalMetrics()
-        obs, _, _, _ = env.reset(poses=init_poses)
-        processed_obs = preprocess_obs(obs)
+        obs_raw, _, _, _ = env.reset(poses=init_poses)
+        obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
 
-        for _ in range(MAX_STEPS):
-            # 추론 시간 측정
+        for _ in range(EVAL_MAX_STEPS):
             start = time.perf_counter()
-            action = model.select_action(processed_obs, training=False)
-            elapsed = time.perf_counter() - start
-            inference_times.append(elapsed)
+            action = model.select_action(obs, training=False)
+            inference_times.append(time.perf_counter() - start)
 
-            next_obs, reward, done, _ = env.step(np.array([action]))
-            metrics.update(next_obs, action, done)
-            processed_obs = preprocess_obs(next_obs)
+            line_idx = model.action_to_line_index(action)
+            waypoints = waypoints_lines[line_idx]
+            x, y = float(obs_raw['poses_x'][0]), float(obs_raw['poses_y'][0])
+            heading = float(obs_raw['poses_theta'][0])
+            speed = float(obs_raw['linear_vels_x'][0])
 
+            steering, pp_speed = controller.compute(x, y, heading, speed, waypoints)
+            final_speed = min(model.action_to_speed(action, SPEED_MIN, SPEED_MAX), pp_speed)
+
+            next_obs_raw, _, done, _ = env.step(np.array([[steering, final_speed]]))
+            metrics.update(next_obs_raw, steering, final_speed, line_idx, waypoints_lines)
+            obs = preprocess_obs(next_obs_raw, waypoints_lines, num_lines)
+            obs_raw = next_obs_raw
             if done:
                 break
 
-        result = metrics.summary(episode)
-        all_results.append(result)
+        all_results.append(metrics.summary(episode))
 
-    avg_time = np.mean(inference_times) * 1000  # ms 변환
-
-    print(f'\n{"═"*50}')
-    print(f'[{label}] 전체 {N_EPISODES} 에피소드 평균')
-    print(f'{"═"*50}')
-    print(f'평균 충돌 횟수 : {np.mean([r["collisions"] for r in all_results]):.1f} 회')
-    print(f'평균 속도      : {np.mean([r["avg_speed"] for r in all_results]):.3f} m/s')
-    print(f'평균 바퀴 떨림 : {np.mean([r["wheel_tremor"] for r in all_results]):.4f} rad/step')
-    print(f'평균 추론 시간 : {avg_time:.3f} ms')
-    print(f'{"═"*50}\n')
-
+    avg_time = np.mean(inference_times) * 1000
+    print(f'\n[{label}] 평균 추론 시간: {avg_time:.3f} ms')
     return all_results, avg_time
 
 
 def get_model_size(model, path=None):
-    """모델 파일 크기 (MB)"""
     if path and os.path.exists(path):
         return os.path.getsize(path) / (1024 * 1024)
-    # 임시 저장해서 크기 측정
     tmp = '/tmp/tmp_model.pth'
     torch.save(model.state_dict(), tmp)
     size = os.path.getsize(tmp) / (1024 * 1024)
@@ -101,61 +79,49 @@ def get_model_size(model, path=None):
 
 
 def main():
-    print('\n양자화 비교 평가 시작')
-    print(f'원본 모델: {MODEL_PATH}\n')
+    print('\n양자화 비교 평가 시작\n')
 
-    # 1) 원본 FP32 모델 로드
-    fp32_model = load_fp32_model(MODEL_PATH)
-    fp32_size = get_model_size(fp32_model, MODEL_PATH)
+    waypoints_lines = load_racing_lines()
+    num_lines = MODEL_CONFIG.get('num_lines', LINE_CONFIG['num_lines'])
+    controller = PurePursuitController(max_speed=SPEED_MAX, min_speed=SPEED_MIN)
 
-    # 2) 동적 양자화 적용 (FP32 → INT8)
+    fp32_model = load_model(MODEL_SAVE_PATH)
+    fp32_size = get_model_size(fp32_model, MODEL_SAVE_PATH)
+
     int8_model = quantize_dynamic(fp32_model)
     torch.save(int8_model.state_dict(), QUANTIZED_PATH)
     int8_size = get_model_size(int8_model, QUANTIZED_PATH)
 
-    print(f'모델 크기 비교:')
-    print(f'  FP32 : {fp32_size:.2f} MB')
-    print(f'  INT8 : {int8_size:.2f} MB')
-    print(f'  압축률: {(1 - int8_size/fp32_size)*100:.1f}%\n')
+    print(f'모델 크기: FP32={fp32_size:.2f}MB | INT8={int8_size:.2f}MB | '
+          f'압축률={( 1 - int8_size / fp32_size) * 100:.1f}%\n')
 
-    # 3) 환경 생성 및 비교 평가
     env = gym.make('f110_gym:f110-v0', **ENV_CONFIG)
 
-    print('─' * 50)
-    print('FP32 원본 모델 평가')
-    print('─' * 50)
-    fp32_results, fp32_time = evaluate_model(fp32_model, env, "FP32")
+    fp32_results, fp32_time = evaluate_model(fp32_model, env, waypoints_lines, controller, num_lines, "FP32")
+    int8_results, int8_time = evaluate_model(int8_model, env, waypoints_lines, controller, num_lines, "INT8")
 
-    print('─' * 50)
-    print('INT8 양자화 모델 평가')
-    print('─' * 50)
-    int8_results, int8_time = evaluate_model(int8_model, env, "INT8")
+    print(f'\n{"═"*60}')
+    print(f'최종 비교 (FP32 vs INT8)')
+    print(f'{"═"*60}')
+    print(f'{"항목":<18} {"FP32":>10} {"INT8":>10} {"변화":>10}')
+    print(f'{"─"*60}')
 
-    # 4) 최종 비교 요약
-    print(f'\n{"═"*50}')
-    print(f'최종 비교 요약 (FP32 vs INT8)')
-    print(f'{"═"*50}')
-    print(f'{"항목":<15} {"FP32":>10} {"INT8":>10} {"변화":>10}')
-    print(f'{"─"*50}')
+    for label, key, fmt in [
+        ('충돌 횟수', 'collisions', '.1f'),
+        ('평균 속도', 'avg_speed', '.3f'),
+        ('바퀴 떨림', 'wheel_tremor', '.4f'),
+        ('라인 이탈(m)', 'avg_deviation', '.4f'),
+        ('라인 전환', 'line_switches', '.1f'),
+    ]:
+        f = np.mean([r[key] for r in fp32_results])
+        i = np.mean([r[key] for r in int8_results])
+        print(f'{label:<18} {f:>10{fmt}} {i:>10{fmt}} {i-f:>+10{fmt}}')
 
-    fp32_col = np.mean([r["collisions"] for r in fp32_results])
-    int8_col = np.mean([r["collisions"] for r in int8_results])
-    print(f'{"충돌 횟수":<15} {fp32_col:>10.1f} {int8_col:>10.1f} {int8_col-fp32_col:>+10.1f}')
-
-    fp32_spd = np.mean([r["avg_speed"] for r in fp32_results])
-    int8_spd = np.mean([r["avg_speed"] for r in int8_results])
-    print(f'{"평균 속도":<15} {fp32_spd:>10.3f} {int8_spd:>10.3f} {int8_spd-fp32_spd:>+10.3f}')
-
-    fp32_trm = np.mean([r["wheel_tremor"] for r in fp32_results])
-    int8_trm = np.mean([r["wheel_tremor"] for r in int8_results])
-    print(f'{"바퀴 떨림":<15} {fp32_trm:>10.4f} {int8_trm:>10.4f} {int8_trm-fp32_trm:>+10.4f}')
-
-    print(f'{"추론 시간(ms)":<15} {fp32_time:>10.3f} {int8_time:>10.3f} {int8_time-fp32_time:>+10.3f}')
-    print(f'{"모델 크기(MB)":<15} {fp32_size:>10.2f} {int8_size:>10.2f} {int8_size-fp32_size:>+10.2f}')
-    print(f'{"═"*50}\n')
+    print(f'{"추론 시간(ms)":<18} {fp32_time:>10.3f} {int8_time:>10.3f} {int8_time-fp32_time:>+10.3f}')
+    print(f'{"모델 크기(MB)":<18} {fp32_size:>10.2f} {int8_size:>10.2f} {int8_size-fp32_size:>+10.2f}')
+    print(f'{"═"*60}\n')
 
     env.close()
-
 
 if __name__ == '__main__':
     main()
