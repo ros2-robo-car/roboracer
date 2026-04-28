@@ -45,7 +45,7 @@ ENV_CONFIG = {
         'v_switch': 7.319,
         'a_max'   : 9.51,
         'v_min'   : 0.1,
-        'v_max'   : 20.0,
+        'v_max'   : 8.0,
         'width'   : 0.31,
         'length'  : 0.58,
     }
@@ -71,6 +71,10 @@ LINE_CONFIG = {
     'centerline_csv': CENTERLINE_CSV,
     'map_path'      : MAP_PATH,
     'map_ext'       : MAP_EXT,
+    # 시작 위치 설정
+    'start_line_idx': None,      # None이면 가운데 line 사용
+    'start_wp_idx': 0,           # 몇 번째 waypoint에서 시작할지
+    'start_lookahead_idx': 5, 
 }
 
 
@@ -99,7 +103,7 @@ TRAIN_CONFIG = {
     'max_episodes' : 5000,
     'max_steps'    : 5000,
     'eval_interval': 100,
-    'warmup_steps' : 50000,
+    'warmup_steps' : 10000,
 }
 
 
@@ -124,3 +128,14 @@ QUANTIZED_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_quantized.pth'
 EVAL_EPISODES = 10
 EVAL_MAX_STEPS = 1000
 QUANTIZE_EPISODES = 5
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 체크포인트 reward 설정
+# ══════════════════════════════════════════════════════════════════════════════
+REWARD_CONFIG = {
+    'num_checkpoints'        : 10,
+    'checkpoint_arrival'     : 100.0,
+    'speed_reward_scale'     : 50.0,
+    'collision_penalty'      : -1000.0,
+    'lap_completion_reward'  : 500.0,
+}

@@ -58,7 +58,6 @@ def preprocess_lidar(obs_raw: dict) -> np.ndarray:
 
     return lidar.astype(np.float32)
 
-
 def preprocess_obs(
     obs_raw: dict,
     waypoints_lines: list,
@@ -85,14 +84,20 @@ def preprocess_obs(
 
 # ── 평가 지표 ─────────────────────────────────────────────────────────────────
 class EvalMetrics:
-    def __init__(self):
-        self.collisions = 0
+    def __init__(self, reference_waypoints: np.ndarray):
         self.speeds = []
         self.line_deviations = []
         self.line_switches = 0
         self.total_steps = 0
         self.laps_completed = 0
         self.prev_line_idx = None
+
+        # wp 진행률 표시용
+        self.reference_waypoints = reference_waypoints
+        self.reference_len = len(reference_waypoints)
+        self.best_progress_score = -1
+        self.best_progress_idx = 0
+        self.best_progress_pct = 0.0
 
     def update(
         self,
@@ -102,20 +107,31 @@ class EvalMetrics:
         waypoints_lines: list,
     ):
         self.speeds.append(abs(float(speed)))
-
-        if bool(obs_raw['collisions'][0]):
-            self.collisions += 1
-
         self.laps_completed = int(obs_raw['lap_counts'][0])
 
         x = float(obs_raw['poses_x'][0])
         y = float(obs_raw['poses_y'][0])
         position = np.array([x, y], dtype=np.float32)
 
+        # 선택된 line 기준 라인 오차 계산
+
         waypoints = waypoints_lines[line_idx]
         nearest_idx = get_nearest_waypoint_idx(position, waypoints)
         deviation = float(np.linalg.norm(waypoints[nearest_idx] - position))
         self.line_deviations.append(deviation)
+
+        # 가운데 기준 line으로 wp 진행률 계산
+        progress_idx = get_nearest_waypoint_idx(
+            position,
+            self.reference_waypoints,
+        )
+        progress_pct = progress_idx / self.reference_len * 100.0
+        progress_score = self.laps_completed * self.reference_len + progress_idx
+
+        if progress_score > self.best_progress_score:
+            self.best_progress_score = progress_score
+            self.best_progress_idx = progress_idx
+            self.best_progress_pct = progress_pct
 
         if self.prev_line_idx is not None and line_idx != self.prev_line_idx:
             self.line_switches += 1
@@ -134,21 +150,25 @@ class EvalMetrics:
         print(f'\n{"─" * 45}')
         print(f'에피소드 {episode + 1} 결과')
         print(f'{"─" * 45}')
-        print(f'충돌 횟수     : {self.collisions}')
         print(f'완주 lap      : {self.laps_completed}')
         print(f'평균 속도     : {avg_speed:.3f} m/s')
         print(f'평균 라인 오차: {avg_deviation:.4f} m')
         print(f'라인 전환 횟수: {self.line_switches}')
         print(f'총 스텝       : {self.total_steps}')
+        print(
+            f'wp 진행       : {self.best_progress_idx}/{self.reference_len} '
+            f'({self.best_progress_pct:.1f}%)'
+        )
         print(f'{"─" * 45}\n')
 
         return {
-            'collisions': self.collisions,
             'laps_completed': self.laps_completed,
             'avg_speed': avg_speed,
             'avg_deviation': avg_deviation,
             'line_switches': self.line_switches,
             'total_steps': self.total_steps,
+            'progress_idx': self.best_progress_idx,
+            'progress_pct': self.best_progress_pct,
         }
 
 
@@ -175,6 +195,50 @@ def load_racing_lines() -> list:
     print(f'라인 {len(wp["lines"])}개 로드 완료')
     return wp['lines']
 
+def make_init_pose(waypoints_lines: list) -> np.ndarray:
+    """
+    config.py의 LINE_CONFIG 설정을 기준으로 시작 위치와 heading을 자동 계산한다.
+
+    시작 위치:
+    - start_line_idx가 None이면 가운데 line 사용
+    - start_wp_idx 번째 waypoint에서 시작
+
+    시작 방향:
+    - start_wp_idx → start_wp_idx + start_lookahead_idx 방향으로 계산
+    """
+    num_lines = len(waypoints_lines)
+
+    start_line_idx = LINE_CONFIG.get('start_line_idx', None)
+    if start_line_idx is None:
+        start_line_idx = num_lines // 2
+
+    start_wp_idx = LINE_CONFIG.get('start_wp_idx', 0)
+    lookahead_idx = LINE_CONFIG.get('start_lookahead_idx', 5)
+
+    reference_line = waypoints_lines[start_line_idx]
+    n = len(reference_line)
+
+    p0 = reference_line[start_wp_idx % n]
+    p1 = reference_line[(start_wp_idx + lookahead_idx) % n]
+
+    dx = p1[0] - p0[0]
+    dy = p1[1] - p0[1]
+
+    heading = float(np.arctan2(dy, dx))
+
+    init_poses = np.array([
+        [float(p0[0]), float(p0[1]), heading]
+    ])
+
+    print(
+        f'시작 pose 자동 설정 | '
+        f'line: {start_line_idx}, '
+        f'wp: {start_wp_idx}, '
+        f'x: {p0[0]:.3f}, y: {p0[1]:.3f}, '
+        f'theta: {heading:.3f}'
+    )
+
+    return init_poses
 
 # ── 모델 로드 ─────────────────────────────────────────────────────────────────
 def load_model(path: str) -> SAC:
@@ -248,6 +312,10 @@ def main():
     waypoints_lines = load_racing_lines()
     num_lines = MODEL_CONFIG.get('num_lines', LINE_CONFIG['num_lines'])
 
+    # wp 진행률 표시용 기준 라인
+    # SAC가 선택한 line은 바뀔 수 있으므로 가운데 line 기준으로 표시
+    progress_reference_line = waypoints_lines[num_lines // 2]
+
     model = load_model(MODEL_SAVE_PATH)
 
     controller = PurePursuitController(
@@ -255,12 +323,12 @@ def main():
         min_speed=SPEED_MIN,
     )
 
-    init_poses = np.array([[0.0, 0.0, np.pi / 2]])
+    init_poses = make_init_pose(waypoints_lines)
 
     all_results = []
 
     for episode in range(EVAL_EPISODES):
-        metrics = EvalMetrics()
+        metrics = EvalMetrics(progress_reference_line)
 
         obs_raw, _, _, _ = env.reset(poses=init_poses)
         obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
@@ -298,10 +366,6 @@ def main():
     print(f'전체 {EVAL_EPISODES} 에피소드 평균')
     print(f'{"═" * 45}')
     print(
-        f'평균 충돌 횟수 : '
-        f'{np.mean([r["collisions"] for r in all_results]):.2f}'
-    )
-    print(
         f'평균 완주 lap  : '
         f'{np.mean([r["laps_completed"] for r in all_results]):.2f}'
     )
@@ -320,6 +384,14 @@ def main():
     print(
         f'평균 스텝 수   : '
         f'{np.mean([r["total_steps"] for r in all_results]):.2f}'
+    )
+    print(
+        f'평균 wp 진행률: '
+        f'{np.mean([r["progress_pct"] for r in all_results]):.1f}%'
+    )
+    print(
+        f'최대 wp 진행률: '
+        f'{np.max([r["progress_pct"] for r in all_results]):.1f}%'
     )
     print(f'{"═" * 45}\n')
 

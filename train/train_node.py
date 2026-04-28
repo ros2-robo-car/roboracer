@@ -1,8 +1,14 @@
 """
-train_node.py (라인 선택 버전)
-──────────────────────────────
-SAC가 라인을 선택하고, Pure Pursuit이 선택된 라인을 추종하는 구조.
-학습 설정은 config.py에서 관리.
+train_node.py
+
+SAC가 주행 라인과 목표 속도를 선택하고,
+Pure Pursuit가 선택된 라인을 추종하는 구조.
+
+reward 설계:
+- waypoint를 10개 체크포인트로 나눠서 통과 시에만 보상
+- 체크포인트 보상 = 도착 보상 + 구간 평균속도 보상
+- 체크포인트 사이(매 스텝)에는 reward = 0
+- 충돌 페널티 = -1000
 """
 
 import os
@@ -25,6 +31,7 @@ from config import (
     LINE_CONFIG,
     MODEL_CONFIG,
     TRAIN_CONFIG,
+    REWARD_CONFIG,
     SPEED_MIN,
     SPEED_MAX,
     MODEL_SAVE_PATH,
@@ -33,6 +40,89 @@ from config import (
 from sac_model import SAC, build_observation, get_obs_dim
 from waypoint_loader import load_waypoints, get_nearest_waypoint_idx
 from pure_pursuit import PurePursuitController
+
+
+# ── 체크포인트 설정 (config.py에서 로드) ──────────────────────────────────────
+NUM_CHECKPOINTS          = REWARD_CONFIG['num_checkpoints']
+CHECKPOINT_ARRIVAL_REWARD = REWARD_CONFIG['checkpoint_arrival']
+SPEED_REWARD_SCALE       = REWARD_CONFIG['speed_reward_scale']
+COLLISION_PENALTY        = REWARD_CONFIG['collision_penalty']
+LAP_COMPLETION_REWARD    = REWARD_CONFIG['lap_completion_reward']
+
+
+def build_checkpoint_indices(n_waypoints: int, num_checkpoints: int = None) -> list:
+    if num_checkpoints is None:
+        num_checkpoints = NUM_CHECKPOINTS
+    """
+    waypoint를 num_checkpoints 등분하여 체크포인트 인덱스 리스트를 만든다.
+    예: waypoint 200개, 체크포인트 10개 → [20, 40, 60, 80, 100, 120, 140, 160, 180, 0]
+    마지막 체크포인트는 출발점(0)으로, 한 바퀴 완주를 의미한다.
+    """
+    step = n_waypoints // num_checkpoints
+    indices = [(i + 1) * step % n_waypoints for i in range(num_checkpoints)]
+    return indices
+
+
+class CheckpointTracker:
+    """
+    체크포인트 통과를 추적하고, 구간 평균속도를 계산한다.
+    """
+    def __init__(self, n_waypoints: int):
+        self.checkpoint_indices = build_checkpoint_indices(n_waypoints)
+        self.n_waypoints = n_waypoints
+        self.next_checkpoint = 0          # 다음에 통과해야 할 체크포인트 번호 (0~9)
+        self.segment_speeds = []          # 현재 구간에서 수집한 속도들
+        self.checkpoints_passed = 0       # 총 통과한 체크포인트 수
+
+    def reset(self):
+        self.next_checkpoint = 0
+        self.segment_speeds = []
+        self.checkpoints_passed = 0
+
+    def add_speed(self, speed: float):
+        """매 스텝마다 현재 속도를 기록한다."""
+        self.segment_speeds.append(abs(speed))
+
+    def check(self, nearest_idx: int) -> tuple:
+        """
+        현재 nearest_idx가 다음 체크포인트를 통과했는지 확인한다.
+
+        Returns:
+            (passed, avg_speed, is_lap_complete)
+            - passed: 체크포인트를 통과했으면 True
+            - avg_speed: 구간 평균속도 (통과 시에만 유효)
+            - is_lap_complete: 마지막 체크포인트(한 바퀴)를 통과했으면 True
+        """
+        if self.next_checkpoint >= len(self.checkpoint_indices):
+            return False, 0.0, False
+
+        target_idx = self.checkpoint_indices[self.next_checkpoint]
+
+        # 체크포인트 통과 판정:
+        # target 근처 waypoint에 도달했는지 확인 (전체 waypoint의 5% 범위)
+        threshold = max(self.n_waypoints // 20, 3)
+
+        # 순환 구조를 고려한 거리 계산
+        dist = (nearest_idx - target_idx) % self.n_waypoints
+        if dist > self.n_waypoints // 2:
+            dist = self.n_waypoints - dist
+
+        # target_idx를 지나쳤는지 (앞쪽에 있는지) 확인
+        forward_dist = (nearest_idx - target_idx) % self.n_waypoints
+        passed = forward_dist <= threshold and forward_dist > 0
+
+        if not passed:
+            return False, 0.0, False
+
+        # 통과 확인 → 구간 평균속도 계산
+        avg_speed = float(np.mean(self.segment_speeds)) if self.segment_speeds else 0.0
+        self.segment_speeds = []  # 다음 구간을 위해 초기화
+
+        self.checkpoints_passed += 1
+        is_last = (self.next_checkpoint == len(self.checkpoint_indices) - 1)
+        self.next_checkpoint += 1
+
+        return True, avg_speed, is_last
 
 
 # ── 웨이포인트 로드 ───────────────────────────────────────────────────────────
@@ -57,6 +147,45 @@ def load_racing_lines() -> dict:
 
     print(f'라인 {len(wp["lines"])}개 생성 완료 (점 수: {len(wp["lines"][0])})')
     return wp
+
+
+def make_init_pose(waypoints_lines: list) -> np.ndarray:
+    """
+    config.py의 LINE_CONFIG 설정을 기준으로 시작 위치와 heading을 자동 계산한다.
+    """
+    num_lines = len(waypoints_lines)
+
+    start_line_idx = LINE_CONFIG.get('start_line_idx', None)
+    if start_line_idx is None:
+        start_line_idx = num_lines // 2
+
+    start_wp_idx = LINE_CONFIG.get('start_wp_idx', 0)
+    lookahead_idx = LINE_CONFIG.get('start_lookahead_idx', 5)
+
+    reference_line = waypoints_lines[start_line_idx]
+    n = len(reference_line)
+
+    p0 = reference_line[start_wp_idx % n]
+    p1 = reference_line[(start_wp_idx + lookahead_idx) % n]
+
+    dx = p1[0] - p0[0]
+    dy = p1[1] - p0[1]
+
+    heading = float(np.arctan2(dy, dx))
+
+    init_poses = np.array([
+        [float(p0[0]), float(p0[1]), heading]
+    ])
+
+    print(
+        f'시작 pose 자동 설정 | '
+        f'line: {start_line_idx}, '
+        f'wp: {start_wp_idx}, '
+        f'x: {p0[0]:.3f}, y: {p0[1]:.3f}, '
+        f'theta: {heading:.3f}'
+    )
+
+    return init_poses
 
 
 # ── 전처리 ────────────────────────────────────────────────────────────────────
@@ -85,7 +214,11 @@ def preprocess_lidar(obs_raw: dict) -> np.ndarray:
     return lidar.astype(np.float32)
 
 
-def preprocess_obs(obs_raw: dict, waypoints_lines: list, num_lines: int) -> np.ndarray:
+def preprocess_obs(
+    obs_raw: dict,
+    waypoints_lines: list,
+    num_lines: int,
+) -> np.ndarray:
     lidar = preprocess_lidar(obs_raw)
 
     position = np.array(
@@ -113,14 +246,6 @@ def action_to_env(
     waypoints_lines: list,
     controller: PurePursuitController,
 ) -> np.ndarray:
-    """
-    SAC action:
-    action[0] → 라인 선택
-    action[1] → 목표 속도
-
-    실제 env action:
-    [steering, speed]
-    """
     line_idx = model.action_to_line_index(action)
     waypoints = waypoints_lines[line_idx]
 
@@ -130,16 +255,10 @@ def action_to_env(
     current_speed = float(obs_raw['linear_vels_x'][0])
 
     steering, pp_speed = controller.compute(
-        x,
-        y,
-        heading,
-        current_speed,
-        waypoints,
+        x, y, heading, current_speed, waypoints,
     )
 
     sac_speed = model.action_to_speed(action, SPEED_MIN, SPEED_MAX)
-
-    # SAC가 고른 속도와 Pure Pursuit가 곡률 기반으로 제한한 속도 중 더 작은 값 사용
     target_speed = min(sac_speed, pp_speed)
 
     return np.array([steering, target_speed], dtype=np.float32)
@@ -151,118 +270,108 @@ def compute_reward(
     action: np.ndarray,
     model: SAC,
     waypoints_lines: list,
-    prev_pos,
-    prev_lap: int,
-    prev_line_idx: int,
-    prev_nearest_idx: int,
+    checkpoint_tracker: CheckpointTracker,
 ):
+    """
+    체크포인트 기반 reward.
+
+    - 매 스텝: reward = 0 (속도만 기록)
+    - 체크포인트 통과 시: 도착 보상 + 구간 평균속도 보상
+    - 한 바퀴 완주 시: 추가 보너스
+    - 충돌 시: -1000
+    """
     x = float(obs_raw['poses_x'][0])
     y = float(obs_raw['poses_y'][0])
     speed = abs(float(obs_raw['linear_vels_x'][0]))
     collision = bool(obs_raw['collisions'][0])
-    lap_count = int(obs_raw['lap_counts'][0])
 
     line_idx = model.action_to_line_index(action)
     waypoints = waypoints_lines[line_idx]
 
     position = np.array([x, y], dtype=np.float32)
     nearest_idx = get_nearest_waypoint_idx(position, waypoints)
-    nearest_dist = float(np.linalg.norm(waypoints[nearest_idx] - position))
 
+    # 충돌 → 큰 페널티
     if collision:
-        return -10.0, (x, y), lap_count, line_idx, nearest_idx
+        return COLLISION_PENALTY, line_idx, nearest_idx
 
-    n_waypoints = len(waypoints)
+    # 매 스텝 속도 기록
+    checkpoint_tracker.add_speed(speed)
 
-    # 진행도 보상
-    progress = (nearest_idx - prev_nearest_idx) % n_waypoints
+    # 체크포인트 통과 확인
+    passed, avg_speed, is_lap_complete = checkpoint_tracker.check(nearest_idx)
 
-    # 역방향으로 크게 튄 경우 보상 제거
-    if progress > n_waypoints // 2:
-        progress = 0
+    if not passed:
+        # 체크포인트 사이에는 reward = 0
+        return 0.0, line_idx, nearest_idx
 
-    progress_reward = progress * 1.0
+    # 체크포인트 통과 보상
+    reward = CHECKPOINT_ARRIVAL_REWARD
 
-    # 속도 보상
-    speed_reward = (speed / SPEED_MAX) * 0.5
+    # 구간 평균속도 보상: 빠를수록 높은 보상
+    speed_ratio = avg_speed / SPEED_MAX  # 0~1 범위
+    reward += SPEED_REWARD_SCALE * speed_ratio
 
-    # 랩 완료 보상
-    lap_reward = 100.0 if lap_count > prev_lap else 0.0
+    # 한 바퀴 완주 보너스
+    if is_lap_complete:
+        reward += LAP_COMPLETION_REWARD
 
-    # 선택한 라인에서 멀어지면 페널티
-    distance_penalty = -0.5 * nearest_dist
-
-    # 라인을 너무 자주 바꾸면 페널티
-    line_change_penalty = -0.3 if line_idx != prev_line_idx else 0.0
-
-    reward = (
-        progress_reward
-        + speed_reward
-        + lap_reward
-        + distance_penalty
-        + line_change_penalty
-    )
-
-    return reward, (x, y), lap_count, line_idx, nearest_idx
+    return reward, line_idx, nearest_idx
 
 
-# ── Warmup ────────────────────────────────────────────────────────────────────
-def simple_policy(obs_raw: dict) -> np.ndarray:
-    """
-    초기 warmup 동안 사용할 단순 주행 정책.
-    가장 멀리 뚫린 방향으로 조향하고, 전방 거리에 따라 속도 결정.
-    """
-    scan = np.array(obs_raw['scans'][0], dtype=np.float32)
-    scan = np.where(np.isfinite(scan), scan, 0.0)
-
-    n = len(scan)
-    front_scan = scan[n // 4: 3 * n // 4]
-
-    max_idx = int(np.argmax(front_scan))
-    mid = len(front_scan) // 2
-
-    steer = float(np.clip((max_idx - mid) / mid * 0.4, -0.4, 0.4))
-
-    front_dist = float(np.mean(front_scan[max(0, mid - 10):mid + 10]))
-    speed = float(np.clip(front_dist * 0.8, 1.0, 5.0))
-
-    return np.array([steer, speed], dtype=np.float32)
-
-
-def warmup_action_to_sac(
+# ── Warmup (Pure Pursuit 기반) ────────────────────────────────────────────────
+def make_warmup_action(
     obs_raw: dict,
     waypoints_lines: list,
     num_lines: int,
+    controller: PurePursuitController,
 ) -> np.ndarray:
     """
-    simple_policy로 실제 env action을 만들되,
-    replay buffer에는 SAC action 형식인 [line_select, speed_select]로 저장.
+    Pure Pursuit 알고리즘으로 실제 주행 가능한 action을 생성한다.
+
+    1. 현재 위치에서 가장 가까운 라인을 찾는다.
+    2. 해당 라인에 대해 Pure Pursuit으로 속도를 계산한다.
+    3. 라인 인덱스와 속도를 SAC action 형태 [-1, 1]로 변환한다.
+
+    이렇게 하면 warmup 동안 replay buffer에 쌓이는 데이터가
+    실제로 주행 가능한 (state, action, reward) 쌍이 되어
+    학습 초기 품질이 크게 향상된다.
     """
     x = float(obs_raw['poses_x'][0])
     y = float(obs_raw['poses_y'][0])
+    heading = float(obs_raw['poses_theta'][0])
+    current_speed = float(obs_raw['linear_vels_x'][0])
     position = np.array([x, y], dtype=np.float32)
 
+    # 가장 가까운 라인 찾기
     min_dist = float('inf')
     best_line = num_lines // 2
 
     for i, wp in enumerate(waypoints_lines):
         idx = get_nearest_waypoint_idx(position, wp)
         dist = float(np.linalg.norm(wp[idx] - position))
-
         if dist < min_dist:
             min_dist = dist
             best_line = i
 
-    # line index → -1~1
+    # 약간의 탐색: 80%는 최적 라인, 20%는 랜덤 라인
+    if np.random.rand() < 0.2:
+        line_idx = np.random.randint(0, num_lines)
+    else:
+        line_idx = best_line
+
+    # 선택된 라인에 대해 Pure Pursuit으로 속도 계산
+    waypoints = waypoints_lines[line_idx]
+    _, pp_speed = controller.compute(x, y, heading, current_speed, waypoints)
+    pp_speed = min(pp_speed, 1.5)
+
+    # SAC action 형태로 변환 [-1, 1]
     if num_lines > 1:
-        line_val = (best_line / (num_lines - 1)) * 2.0 - 1.0
+        line_val = (line_idx / (num_lines - 1)) * 2.0 - 1.0
     else:
         line_val = 0.0
 
-    env_action = simple_policy(obs_raw)
-
-    # speed → -1~1
-    speed_val = ((env_action[1] - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)) * 2.0 - 1.0
+    speed_val = ((pp_speed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)) * 2.0 - 1.0
     speed_val = float(np.clip(speed_val, -1.0, 1.0))
 
     return np.array([line_val, speed_val], dtype=np.float32)
@@ -280,6 +389,21 @@ def build_model(obs_dim: int) -> SAC:
         MODEL_CONFIG['hidden_dims'],
         MODEL_CONFIG['num_lines'],
     )
+
+
+def get_wp_progress(obs_raw: dict, reference_waypoints: np.ndarray):
+    x = float(obs_raw['poses_x'][0])
+    y = float(obs_raw['poses_y'][0])
+    lap_count = int(obs_raw['lap_counts'][0])
+
+    position = np.array([x, y], dtype=np.float32)
+    nearest_idx = get_nearest_waypoint_idx(position, reference_waypoints)
+    n_waypoints = len(reference_waypoints)
+
+    progress_pct = nearest_idx / n_waypoints * 100.0
+    progress_score = lap_count * n_waypoints + nearest_idx
+
+    return nearest_idx, progress_pct, progress_score
 
 
 # ── 리플레이 버퍼 ─────────────────────────────────────────────────────────────
@@ -310,6 +434,7 @@ class ReplayBuffer:
 class Trainer:
     def __init__(self, obs_dim: int):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         print(
             f'device: {self.device} | '
             f'obs_dim: {obs_dim} | '
@@ -343,6 +468,7 @@ class Trainer:
             device=self.device,
         )
         self.alpha = self.log_alpha.exp()
+
         self.alpha_opt = optim.Adam(
             [self.log_alpha],
             lr=TRAIN_CONFIG['lr_alpha'],
@@ -365,7 +491,6 @@ class Trainer:
         gamma = TRAIN_CONFIG['gamma']
         tau = TRAIN_CONFIG['tau']
 
-        # Critic target 계산
         with torch.no_grad():
             next_action, next_log_prob = self.model.actor.sample(next_obs)
 
@@ -375,19 +500,16 @@ class Trainer:
 
             target_q = reward + (1.0 - done) * gamma * target_q
 
-        # Critic 1 업데이트
         critic1_loss = F.mse_loss(self.model.critic1(obs, action), target_q)
         self.critic1_opt.zero_grad()
         critic1_loss.backward()
         self.critic1_opt.step()
 
-        # Critic 2 업데이트
         critic2_loss = F.mse_loss(self.model.critic2(obs, action), target_q)
         self.critic2_opt.zero_grad()
         critic2_loss.backward()
         self.critic2_opt.step()
 
-        # Actor 업데이트
         new_action, log_prob = self.model.actor.sample(obs)
 
         q1_new = self.model.critic1(obs, new_action)
@@ -400,7 +522,6 @@ class Trainer:
         actor_loss.backward()
         self.actor_opt.step()
 
-        # Alpha 업데이트
         alpha_loss = -(
             self.log_alpha * (log_prob + self.target_entropy).detach()
         ).mean()
@@ -411,7 +532,6 @@ class Trainer:
 
         self.alpha = self.log_alpha.exp()
 
-        # Target critic soft update
         for critic, target_critic in [
             (self.model.critic1, self.model.target_critic1),
             (self.model.critic2, self.model.target_critic2),
@@ -429,48 +549,32 @@ class Trainer:
         env,
         waypoints_lines: list,
         controller: PurePursuitController,
+        init_poses: np.ndarray,
         n_episodes: int = 3,
     ) -> float:
         total_reward = 0.0
-        init_poses = np.array([[0.0, 0.0, np.pi / 2]])
         num_lines = MODEL_CONFIG['num_lines']
 
         for _ in range(n_episodes):
             obs_raw, _, _, _ = env.reset(poses=init_poses)
             obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
 
-            prev_pos = (
-                float(obs_raw['poses_x'][0]),
-                float(obs_raw['poses_y'][0]),
-            )
-            prev_lap = int(obs_raw['lap_counts'][0])
-            prev_line_idx = num_lines // 2
-            prev_nearest_idx = 0
+            # 평가용 체크포인트 트래커
+            n_wp = len(waypoints_lines[num_lines // 2])
+            eval_tracker = CheckpointTracker(n_wp)
 
             for _ in range(TRAIN_CONFIG['max_steps']):
                 action = self.model.select_action(obs, training=False)
 
                 env_action = action_to_env(
-                    action,
-                    obs_raw,
-                    self.model,
-                    waypoints_lines,
-                    controller,
+                    action, obs_raw, self.model, waypoints_lines, controller,
                 )
 
                 next_obs_raw, _, done, _ = env.step(np.array([env_action]))
 
-                reward, prev_pos, prev_lap, prev_line_idx, prev_nearest_idx = (
-                    compute_reward(
-                        next_obs_raw,
-                        action,
-                        self.model,
-                        waypoints_lines,
-                        prev_pos,
-                        prev_lap,
-                        prev_line_idx,
-                        prev_nearest_idx,
-                    )
+                reward, _, _ = compute_reward(
+                    next_obs_raw, action, self.model,
+                    waypoints_lines, eval_tracker,
                 )
 
                 obs = preprocess_obs(next_obs_raw, waypoints_lines, num_lines)
@@ -512,6 +616,9 @@ def main():
     wp = load_racing_lines()
     waypoints_lines = wp['lines']
 
+    progress_reference_line = waypoints_lines[num_lines // 2]
+    n_waypoints = len(progress_reference_line)
+
     controller = PurePursuitController(
         max_speed=SPEED_MAX,
         min_speed=SPEED_MIN,
@@ -523,82 +630,76 @@ def main():
     best_reward = -float('inf')
     total_steps = 0
 
-    init_poses = np.array([[0.0, 0.0, np.pi / 2]])
+    init_poses = make_init_pose(waypoints_lines)
+
+    # 체크포인트 인덱스 출력
+    cp_indices = build_checkpoint_indices(n_waypoints)
+    print(f'\n체크포인트 {NUM_CHECKPOINTS}개 설정: {cp_indices}')
+    print(f'총 waypoint 수: {n_waypoints}')
 
     print(
         f'\n학습 시작 | map: {ENV_CONFIG["map"]} | '
         f'obs_dim: {obs_dim} | lines: {num_lines}'
     )
-    print(f'속도 범위: {SPEED_MIN}~{SPEED_MAX} m/s\n')
+    print(f'속도 범위: {SPEED_MIN}~{SPEED_MAX} m/s')
+    print(f'reward: 체크포인트 도착={CHECKPOINT_ARRIVAL_REWARD}, '
+          f'속도 스케일={SPEED_REWARD_SCALE}, '
+          f'충돌={COLLISION_PENALTY}, '
+          f'완주 보너스={LAP_COMPLETION_REWARD}\n')
 
     for episode in range(TRAIN_CONFIG['max_episodes']):
         obs_raw, _, _, _ = env.reset(poses=init_poses)
         obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
 
         episode_reward = 0.0
-        collisions = 0
         speeds = []
 
-        prev_pos = (
-            float(obs_raw['poses_x'][0]),
-            float(obs_raw['poses_y'][0]),
-        )
-        prev_lap = int(obs_raw['lap_counts'][0])
-        prev_line_idx = num_lines // 2
-        prev_nearest_idx = 0
+        # wp 진행 상황 기록용
+        best_progress_score = -1
+        best_progress_idx = 0
+        best_progress_pct = 0.0
+
+        # 에피소드마다 체크포인트 트래커 초기화
+        checkpoint_tracker = CheckpointTracker(n_waypoints)
 
         for _ in range(TRAIN_CONFIG['max_steps']):
             if total_steps < TRAIN_CONFIG['warmup_steps']:
-                action = warmup_action_to_sac(
-                    obs_raw,
-                    waypoints_lines,
-                    num_lines,
+                action = make_warmup_action(
+                    obs_raw, waypoints_lines, num_lines, controller,
                 )
-                env_action = simple_policy(obs_raw)
             else:
                 action = trainer.model.select_action(obs, training=True)
-
-                # 탐색 노이즈 추가
                 action = action + np.random.normal(0, 0.1, size=action.shape)
                 action = np.clip(action, -1.0, 1.0)
 
-                env_action = action_to_env(
-                    action,
-                    obs_raw,
-                    trainer.model,
-                    waypoints_lines,
-                    controller,
-                )
+            env_action = action_to_env(
+                action, obs_raw, trainer.model, waypoints_lines, controller,
+            )
 
             next_obs_raw, _, done, _ = env.step(np.array([env_action]))
+            env.render()
+            # 진행 상황 기록
+            progress_idx, progress_pct, progress_score = get_wp_progress(
+                next_obs_raw, progress_reference_line,
+            )
 
-            if bool(next_obs_raw['collisions'][0]):
-                collisions += 1
+            if progress_score > best_progress_score:
+                best_progress_score = progress_score
+                best_progress_idx = progress_idx
+                best_progress_pct = progress_pct
 
             speeds.append(abs(float(next_obs_raw['linear_vels_x'][0])))
 
-            reward, prev_pos, prev_lap, prev_line_idx, prev_nearest_idx = (
-                compute_reward(
-                    next_obs_raw,
-                    action,
-                    trainer.model,
-                    waypoints_lines,
-                    prev_pos,
-                    prev_lap,
-                    prev_line_idx,
-                    prev_nearest_idx,
-                )
+            reward, prev_line_idx, _ = compute_reward(
+                next_obs_raw, action, trainer.model,
+                waypoints_lines, checkpoint_tracker,
             )
 
             next_obs = preprocess_obs(next_obs_raw, waypoints_lines, num_lines)
 
             if is_valid_obs(obs) and is_valid_obs(next_obs):
                 trainer.buffer.push(
-                    obs,
-                    action,
-                    reward,
-                    next_obs,
-                    float(done),
+                    obs, action, reward, next_obs, float(done),
                 )
 
             obs = next_obs
@@ -613,19 +714,24 @@ def main():
                 break
 
         avg_speed = float(np.mean(speeds)) if speeds else 0.0
+        lap_count = int(obs_raw['lap_counts'][0])
 
         print(
             f'ep {episode:5d} | '
             f'reward: {episode_reward:8.2f} | '
-            f'lap: {prev_lap} | '
+            f'lap: {lap_count} | '
+            f'cp: {checkpoint_tracker.checkpoints_passed}/{NUM_CHECKPOINTS} | '
             f'speed: {avg_speed:.2f} | '
-            f'crash: {collisions} | '
             f'line: {prev_line_idx} | '
-            f'steps: {total_steps}'
+            f'steps: {total_steps} | '
+            f'wp: {best_progress_idx}/{n_waypoints} '
+            f'({best_progress_pct:.1f}%)'
         )
 
         if episode % TRAIN_CONFIG['eval_interval'] == 0 and episode > 0:
-            eval_reward = trainer.evaluate(env, waypoints_lines, controller)
+            eval_reward = trainer.evaluate(
+                env, waypoints_lines, controller, init_poses,
+            )
 
             print(f'[평가] ep {episode} | eval reward: {eval_reward:.2f}')
 
