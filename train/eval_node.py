@@ -4,6 +4,11 @@ eval_node.py
 학습된 SAC 모델 평가 코드.
 SAC는 주행 라인과 목표 속도를 선택하고,
 Pure Pursuit는 선택된 라인을 따라가기 위한 조향각을 계산한다.
+
+수정 사항:
+- lap_counts 기반 progress_score 제거
+- ForwardProgressTracker로 wp 진행률 계산
+- 종료 조건에서 lap_counts >= 2 제거
 """
 
 import os
@@ -21,6 +26,7 @@ from config import (
     OBS_CONFIG,
     LINE_CONFIG,
     MODEL_CONFIG,
+    REWARD_CONFIG,
     SPEED_MIN,
     SPEED_MAX,
     MODEL_SAVE_PATH,
@@ -31,6 +37,10 @@ from config import (
 from sac_model import SAC, build_observation, get_obs_dim
 from waypoint_loader import load_waypoints, get_nearest_waypoint_idx
 from pure_pursuit import PurePursuitController
+
+
+MAX_LAPS = REWARD_CONFIG.get('max_laps', 2)
+MAX_FORWARD_WP_JUMP = REWARD_CONFIG.get('max_forward_wp_jump', 30)
 
 
 # ── 전처리 ────────────────────────────────────────────────────────────────────
@@ -58,6 +68,7 @@ def preprocess_lidar(obs_raw: dict) -> np.ndarray:
 
     return lidar.astype(np.float32)
 
+
 def preprocess_obs(
     obs_raw: dict,
     waypoints_lines: list,
@@ -82,6 +93,94 @@ def preprocess_obs(
     ).astype(np.float32)
 
 
+class ForwardProgressTracker:
+    """
+    lap_counts를 사용하지 않고 reference waypoint index 변화량으로
+    전진 진행량을 누적한다.
+    """
+
+    def __init__(
+        self,
+        reference_waypoints: np.ndarray,
+        max_laps: int = 2,
+        max_forward_jump: int = 30,
+    ):
+        self.reference_waypoints = reference_waypoints
+        self.n_waypoints = len(reference_waypoints)
+        self.max_laps = max_laps
+        self.total_waypoints = self.n_waypoints * max_laps
+        self.max_forward_jump = int(max_forward_jump)
+
+        self.prev_idx = None
+        self.forward_progress = 0.0
+        self.ignored_jump_count = 0
+
+    def reset_from_obs(self, obs_raw: dict):
+        x = float(obs_raw['poses_x'][0])
+        y = float(obs_raw['poses_y'][0])
+        position = np.array([x, y], dtype=np.float32)
+
+        self.prev_idx = get_nearest_waypoint_idx(
+            position,
+            self.reference_waypoints,
+        )
+
+        self.forward_progress = 1.0
+        self.ignored_jump_count = 0
+
+    def update(self, obs_raw: dict) -> tuple:
+        """
+        Returns:
+            progress_score, progress_pct, forward_done, progress_delta
+        """
+        x = float(obs_raw['poses_x'][0])
+        y = float(obs_raw['poses_y'][0])
+        position = np.array([x, y], dtype=np.float32)
+
+        nearest_idx = get_nearest_waypoint_idx(
+            position,
+            self.reference_waypoints,
+        )
+
+        if self.prev_idx is None:
+            self.prev_idx = nearest_idx
+
+        prev_progress = self.forward_progress
+
+        delta = nearest_idx - self.prev_idx
+
+        if delta < -self.n_waypoints / 2:
+            delta += self.n_waypoints
+        elif delta > self.n_waypoints / 2:
+            delta -= self.n_waypoints
+
+        if 0 < delta <= self.max_forward_jump:
+            self.forward_progress += delta
+        elif delta > self.max_forward_jump:
+            self.ignored_jump_count += 1
+
+        self.prev_idx = nearest_idx
+
+        progress_delta = max(0.0, self.forward_progress - prev_progress)
+
+        progress_score = int(
+            min(
+                max(self.forward_progress, 0.0),
+                self.total_waypoints,
+            )
+        )
+
+        progress_pct = (
+            progress_score / self.total_waypoints * 100.0
+            if self.total_waypoints > 0
+            else 0.0
+        )
+
+        forward_done = progress_score >= self.total_waypoints
+
+        return progress_score, progress_pct, forward_done, progress_delta
+
+
 # ── 평가 지표 ─────────────────────────────────────────────────────────────────
 class EvalMetrics:
     def __init__(self, reference_waypoints: np.ndarray):
@@ -95,9 +194,14 @@ class EvalMetrics:
         # wp 진행률 표시용
         self.reference_waypoints = reference_waypoints
         self.reference_len = len(reference_waypoints)
-        self.best_progress_score = -1
-        self.best_progress_idx = 0
-        self.best_progress_pct = 0.0
+        self.total_progress_target = self.reference_len * MAX_LAPS
+        self.best_progress_score = 1
+        self.best_progress_pct = (
+            1 / self.total_progress_target * 100.0
+            if self.total_progress_target > 0
+            else 0.0
+        )
+        self.ignored_jump_count = 0
 
     def update(
         self,
@@ -105,6 +209,9 @@ class EvalMetrics:
         speed: float,
         line_idx: int,
         waypoints_lines: list,
+        progress_score: int,
+        progress_pct: float,
+        ignored_jump_count: int,
     ):
         self.speeds.append(abs(float(speed)))
         self.laps_completed = int(obs_raw['lap_counts'][0])
@@ -114,24 +221,16 @@ class EvalMetrics:
         position = np.array([x, y], dtype=np.float32)
 
         # 선택된 line 기준 라인 오차 계산
-
         waypoints = waypoints_lines[line_idx]
         nearest_idx = get_nearest_waypoint_idx(position, waypoints)
         deviation = float(np.linalg.norm(waypoints[nearest_idx] - position))
         self.line_deviations.append(deviation)
 
-        # 가운데 기준 line으로 wp 진행률 계산
-        progress_idx = get_nearest_waypoint_idx(
-            position,
-            self.reference_waypoints,
-        )
-        progress_pct = (progress_idx+1) / self.reference_len * 100.0
-        progress_score = self.laps_completed * self.reference_len + progress_idx
-
         if progress_score > self.best_progress_score:
             self.best_progress_score = progress_score
-            self.best_progress_idx = progress_idx
             self.best_progress_pct = progress_pct
+
+        self.ignored_jump_count = ignored_jump_count
 
         if self.prev_line_idx is not None and line_idx != self.prev_line_idx:
             self.line_switches += 1
@@ -156,9 +255,11 @@ class EvalMetrics:
         print(f'라인 전환 횟수: {self.line_switches}')
         print(f'총 스텝       : {self.total_steps}')
         print(
-            f'wp 진행       : {self.best_progress_idx+1}/{self.reference_len} '
+            f'wp 진행       : {self.best_progress_score}/'
+            f'{self.total_progress_target} '
             f'({self.best_progress_pct:.1f}%)'
         )
+        print(f'ignored jump  : {self.ignored_jump_count}')
         print(f'{"─" * 45}\n')
 
         return {
@@ -167,8 +268,9 @@ class EvalMetrics:
             'avg_deviation': avg_deviation,
             'line_switches': self.line_switches,
             'total_steps': self.total_steps,
-            'progress_idx': self.best_progress_idx,
+            'progress_score': self.best_progress_score,
             'progress_pct': self.best_progress_pct,
+            'ignored_jump_count': self.ignored_jump_count,
         }
 
 
@@ -195,16 +297,10 @@ def load_racing_lines() -> list:
     print(f'라인 {len(wp["lines"])}개 로드 완료')
     return wp['lines']
 
+
 def make_init_pose(waypoints_lines: list) -> np.ndarray:
     """
     config.py의 LINE_CONFIG 설정을 기준으로 시작 위치와 heading을 자동 계산한다.
-
-    시작 위치:
-    - start_line_idx가 None이면 가운데 line 사용
-    - start_wp_idx 번째 waypoint에서 시작
-
-    시작 방향:
-    - start_wp_idx → start_wp_idx + start_lookahead_idx 방향으로 계산
     """
     num_lines = len(waypoints_lines)
 
@@ -239,6 +335,7 @@ def make_init_pose(waypoints_lines: list) -> np.ndarray:
     )
 
     return init_poses
+
 
 # ── 모델 로드 ─────────────────────────────────────────────────────────────────
 def load_model(path: str) -> SAC:
@@ -333,6 +430,13 @@ def main():
         obs_raw, _, _, _ = env.reset(poses=init_poses)
         obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
 
+        progress_tracker = ForwardProgressTracker(
+            progress_reference_line,
+            max_laps=MAX_LAPS,
+            max_forward_jump=MAX_FORWARD_WP_JUMP,
+        )
+        progress_tracker.reset_from_obs(obs_raw)
+
         for _ in range(EVAL_MAX_STEPS):
             action = model.select_action(obs, training=False)
 
@@ -346,18 +450,26 @@ def main():
 
             env_action = np.array([[steering, target_speed]], dtype=np.float32)
             next_obs_raw, _, done, _ = env.step(env_action)
-            #env.render()
+            # env.render()
+
+            progress_score, progress_pct, forward_done, _ = (
+                progress_tracker.update(next_obs_raw)
+            )
+
             metrics.update(
                 next_obs_raw,
                 target_speed,
                 line_idx,
                 waypoints_lines,
+                progress_score,
+                progress_pct,
+                progress_tracker.ignored_jump_count,
             )
 
             obs = preprocess_obs(next_obs_raw, waypoints_lines, num_lines)
             obs_raw = next_obs_raw
 
-            if done or int(next_obs_raw['lap_counts'][0]) >= 2:
+            if done or forward_done:
                 break
 
         all_results.append(metrics.summary(episode))
@@ -392,6 +504,10 @@ def main():
     print(
         f'최대 wp 진행률: '
         f'{np.max([r["progress_pct"] for r in all_results]):.1f}%'
+    )
+    print(
+        f'평균 ignored jump: '
+        f'{np.mean([r["ignored_jump_count"] for r in all_results]):.2f}'
     )
     print(f'{"═" * 45}\n')
 

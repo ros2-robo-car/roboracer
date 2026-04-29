@@ -7,8 +7,15 @@ Pure Pursuit가 선택된 라인을 추종하는 구조.
 reward 설계:
 - waypoint를 10개 체크포인트로 나눠서 통과 시에만 보상
 - 체크포인트 보상 = 도착 보상 + 구간 소요시간 보상 (빠를수록 높음)
-- 체크포인트 사이(매 스텝)에는 reward = 0
+- 체크포인트 사이(매 스텝)에는 기본 checkpoint reward = 0
 - 충돌 페널티 = -1000
+
+수정 사항:
+- lap_counts 기반 wp/progress 계산 제거
+- lap_counts >= 2 종료 조건 제거
+- ForwardProgressTracker로 전진 진행량 계산
+- 시작 waypoint는 이미 방문한 것으로 보고 progress를 1부터 시작
+- waypoint_progress_reward가 설정되어 있으면 전진 progress_delta에 보상 추가
 """
 
 import os
@@ -54,6 +61,11 @@ COLLISION_PENALTY         = REWARD_CONFIG['collision_penalty']
 LAP_COMPLETION_REWARD     = REWARD_CONFIG['lap_completion_reward']
 BASELINE_STEPS            = REWARD_CONFIG.get('baseline_steps', 500)
 
+# ── Forward progress 설정 ────────────────────────────────────────────────────
+MAX_LAPS = REWARD_CONFIG.get('max_laps', 2)
+MAX_FORWARD_WP_JUMP = REWARD_CONFIG.get('max_forward_wp_jump', 30)
+WAYPOINT_PROGRESS_REWARD = REWARD_CONFIG.get('waypoint_progress_reward', 0.0)
+
 
 def build_checkpoint_indices(n_waypoints: int, num_checkpoints: int = None) -> list:
     if num_checkpoints is None:
@@ -89,9 +101,6 @@ class CheckpointTracker:
 
         Returns:
             (passed, segment_steps, is_lap_complete)
-            - passed: 체크포인트를 통과했으면 True
-            - segment_steps: 구간 소요 스텝 수 (통과 시에만 유효)
-            - is_lap_complete: 마지막 체크포인트(한 바퀴)를 통과했으면 True
         """
         if self.next_checkpoint >= len(self.checkpoint_indices):
             return False, 0, False
@@ -113,6 +122,105 @@ class CheckpointTracker:
         self.next_checkpoint += 1
 
         return True, steps, is_last
+
+
+class ForwardProgressTracker:
+    """
+    lap_counts를 사용하지 않고 reference waypoint index 변화량으로
+    전진 진행량을 누적한다.
+
+    - 앞으로 간 경우만 progress 증가
+    - 뒤로 간 경우 progress 감소 없음
+    - 한 step에서 너무 크게 튀는 nearest waypoint는 무시
+    - 시작 waypoint는 이미 방문한 것으로 보고 progress를 1부터 시작
+    """
+
+    def __init__(
+        self,
+        reference_waypoints: np.ndarray,
+        max_laps: int = 2,
+        max_forward_jump: int = 30,
+    ):
+        self.reference_waypoints = reference_waypoints
+        self.n_waypoints = len(reference_waypoints)
+        self.max_laps = max_laps
+        self.total_waypoints = self.n_waypoints * max_laps
+        self.max_forward_jump = int(max_forward_jump)
+
+        self.prev_idx = None
+        self.forward_progress = 0.0
+        self.ignored_jump_count = 0
+
+    def reset_from_obs(self, obs_raw: dict):
+        x = float(obs_raw['poses_x'][0])
+        y = float(obs_raw['poses_y'][0])
+        position = np.array([x, y], dtype=np.float32)
+
+        self.prev_idx = get_nearest_waypoint_idx(
+            position,
+            self.reference_waypoints,
+        )
+
+        # 시작 waypoint도 이미 밟은 것으로 본다.
+        self.forward_progress = 1.0
+        self.ignored_jump_count = 0
+
+    def update(self, obs_raw: dict) -> tuple:
+        """
+        Returns:
+            progress_score, progress_pct, forward_done, progress_delta
+        """
+        x = float(obs_raw['poses_x'][0])
+        y = float(obs_raw['poses_y'][0])
+        position = np.array([x, y], dtype=np.float32)
+
+        nearest_idx = get_nearest_waypoint_idx(
+            position,
+            self.reference_waypoints,
+        )
+
+        if self.prev_idx is None:
+            self.prev_idx = nearest_idx
+
+        prev_progress = self.forward_progress
+
+        delta = nearest_idx - self.prev_idx
+
+        # 원형 waypoint wrap 보정
+        if delta < -self.n_waypoints / 2:
+            delta += self.n_waypoints
+        elif delta > self.n_waypoints / 2:
+            delta -= self.n_waypoints
+
+        # 앞으로 간 경우만 누적
+        if 0 < delta <= self.max_forward_jump:
+            self.forward_progress += delta
+
+        # 너무 큰 양의 jump는 nearest waypoint 튐으로 보고 무시
+        elif delta > self.max_forward_jump:
+            self.ignored_jump_count += 1
+
+        # 뒤로 간 경우는 progress 감소시키지 않음
+        self.prev_idx = nearest_idx
+
+        progress_delta = max(0.0, self.forward_progress - prev_progress)
+
+        progress_score = int(
+            min(
+                max(self.forward_progress, 0.0),
+                self.total_waypoints,
+            )
+        )
+
+        progress_pct = (
+            progress_score / self.total_waypoints * 100.0
+            if self.total_waypoints > 0
+            else 0.0
+        )
+
+        forward_done = progress_score >= self.total_waypoints
+
+        return progress_score, progress_pct, forward_done, progress_delta
 
 
 # ── 브레이크 유틸리티 ─────────────────────────────────────────────────────────
@@ -387,6 +495,8 @@ def build_model(obs_dim: int) -> SAC:
     )
 
 
+# 기존 코드 호환용으로 남겨둠.
+# 새 학습 로그/종료에는 ForwardProgressTracker를 사용한다.
 def get_wp_progress(obs_raw: dict, reference_waypoints: np.ndarray):
     x = float(obs_raw['poses_x'][0])
     y = float(obs_raw['poses_y'][0])
@@ -551,11 +661,20 @@ class Trainer:
         total_reward = 0.0
         num_lines = MODEL_CONFIG['num_lines']
 
+        reference_line = waypoints_lines[num_lines // 2]
+        n_wp = len(reference_line)
+
         for _ in range(n_episodes):
             obs_raw, _, _, _ = env.reset(poses=init_poses)
             obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
 
-            n_wp = len(waypoints_lines[num_lines // 2])
+            progress_tracker = ForwardProgressTracker(
+                reference_line,
+                max_laps=MAX_LAPS,
+                max_forward_jump=MAX_FORWARD_WP_JUMP,
+            )
+            progress_tracker.reset_from_obs(obs_raw)
+
             eval_tracker = CheckpointTracker(n_wp)
 
             for _ in range(TRAIN_CONFIG['max_steps']):
@@ -567,16 +686,22 @@ class Trainer:
 
                 next_obs_raw, _, done, _ = env.step(np.array([env_action]))
 
+                _, _, forward_done, progress_delta = (
+                    progress_tracker.update(next_obs_raw)
+                )
+
                 reward, _, _ = compute_reward(
                     next_obs_raw, action, self.model,
                     waypoints_lines, eval_tracker,
                 )
 
+                reward += WAYPOINT_PROGRESS_REWARD * progress_delta
+
                 obs = preprocess_obs(next_obs_raw, waypoints_lines, num_lines)
                 obs_raw = next_obs_raw
                 total_reward += float(reward)
 
-                if done or int(next_obs_raw['lap_counts'][0]) >= 2:
+                if done or forward_done:
                     break
 
         return total_reward / n_episodes
@@ -638,6 +763,9 @@ def main():
     print(f'속도 범위: {SPEED_MIN}~{SPEED_MAX} m/s')
     print(f'브레이크 gain: {BRAKE_GAIN}')
     print(f'baseline_steps: {BASELINE_STEPS}')
+    print(f'max_laps: {MAX_LAPS}')
+    print(f'max_forward_wp_jump: {MAX_FORWARD_WP_JUMP}')
+    print(f'waypoint_progress_reward: {WAYPOINT_PROGRESS_REWARD}')
     print(f'reward: 체크포인트 도착={CHECKPOINT_ARRIVAL_REWARD}, '
           f'시간 스케일={SPEED_REWARD_SCALE}, '
           f'충돌={COLLISION_PENALTY}, '
@@ -650,11 +778,22 @@ def main():
         episode_reward = 0.0
         speeds = []
 
-        best_progress_score = -1
-        best_progress_idx = 0
-        best_progress_pct = 0.0
+        progress_tracker = ForwardProgressTracker(
+            progress_reference_line,
+            max_laps=MAX_LAPS,
+            max_forward_jump=MAX_FORWARD_WP_JUMP,
+        )
+        progress_tracker.reset_from_obs(obs_raw)
+
+        progress_score = 1
+        progress_pct = (
+            progress_score / (n_waypoints * MAX_LAPS) * 100.0
+            if n_waypoints > 0
+            else 0.0
+        )
 
         checkpoint_tracker = CheckpointTracker(n_waypoints)
+        prev_line_idx = 0
 
         for _ in range(TRAIN_CONFIG['max_steps']):
             if total_steps < TRAIN_CONFIG['warmup_steps']:
@@ -662,6 +801,10 @@ def main():
                     obs_raw, waypoints_lines, num_lines, controller,
                 )
             else:
+                if not is_valid_obs(obs):
+                    print('[WARN] invalid obs before select_action. terminate episode.')
+                    break
+
                 action = trainer.model.select_action(obs, training=True)
                 action = action + np.random.normal(0, 0.1, size=action.shape)
                 action = np.clip(action, -1.0, 1.0)
@@ -670,17 +813,11 @@ def main():
                 )
 
             next_obs_raw, _, done, _ = env.step(np.array([env_action]))
-            #############
-            #env.render()
+            # env.render()
 
-            progress_idx, progress_pct, progress_score = get_wp_progress(
-                next_obs_raw, progress_reference_line,
+            progress_score, progress_pct, forward_done, progress_delta = (
+                progress_tracker.update(next_obs_raw)
             )
-
-            if progress_score > best_progress_score:
-                best_progress_score = progress_score
-                best_progress_idx = progress_idx
-                best_progress_pct = progress_pct
 
             speeds.append(abs(float(next_obs_raw['linear_vels_x'][0])))
 
@@ -689,11 +826,15 @@ def main():
                 waypoints_lines, checkpoint_tracker,
             )
 
+            reward += WAYPOINT_PROGRESS_REWARD * progress_delta
+
             next_obs = preprocess_obs(next_obs_raw, waypoints_lines, num_lines)
+
+            terminal = bool(done or forward_done)
 
             if is_valid_obs(obs) and is_valid_obs(next_obs):
                 trainer.buffer.push(
-                    obs, action, reward, next_obs, float(done),
+                    obs, action, reward, next_obs, float(terminal),
                 )
 
             obs = next_obs
@@ -704,7 +845,7 @@ def main():
             if total_steps >= TRAIN_CONFIG['warmup_steps']:
                 trainer.update()
 
-            if done or int(next_obs_raw['lap_counts'][0]) >= 2:
+            if terminal:
                 break
 
         avg_speed = float(np.mean(speeds)) if speeds else 0.0
@@ -718,8 +859,9 @@ def main():
             f'speed: {avg_speed:.2f} | '
             f'line: {prev_line_idx} | '
             f'steps: {total_steps} | '
-            f'wp: {best_progress_idx + 1}/{n_waypoints} '
-            f'({best_progress_pct:.1f}%)'
+            f'wp: {progress_score}/{n_waypoints * MAX_LAPS} '
+            f'({progress_pct:.1f}%) | '
+            f'ignored_jump: {progress_tracker.ignored_jump_count}'
         )
 
         if episode % TRAIN_CONFIG['eval_interval'] == 0 and episode > 0:
