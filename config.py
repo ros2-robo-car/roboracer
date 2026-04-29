@@ -44,7 +44,7 @@ ENV_CONFIG = {
         'sv_max'  : 3.2,
         'v_switch': 7.319,
         'a_max'   : 9.51,
-        'v_min'   : 0.1,
+        'v_min'   : -5.0,
         'v_max'   : 20.0,
         'width'   : 0.31,
         'length'  : 0.58,
@@ -71,6 +71,10 @@ LINE_CONFIG = {
     'centerline_csv': CENTERLINE_CSV,
     'map_path'      : MAP_PATH,
     'map_ext'       : MAP_EXT,
+    # 시작 위치 설정
+    'start_line_idx'     : None,   # None이면 가운데 line 사용
+    'start_wp_idx'       : 0,      # 몇 번째 waypoint에서 시작할지
+    'start_lookahead_idx': 5,
 }
 
 
@@ -97,17 +101,43 @@ TRAIN_CONFIG = {
     'lr_critic'    : 3e-4,
     'lr_alpha'     : 1e-3,
     'max_episodes' : 5000,
-    'max_steps'    : 5000,
-    'eval_interval': 100,
-    'warmup_steps' : 50000,
+    'max_steps'    : 15000,
+    'eval_interval': 5,
+    'warmup_steps' : 10000,
 }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 속도 설정
 # ══════════════════════════════════════════════════════════════════════════════
-SPEED_MIN = 0.5
-SPEED_MAX = 3.0
+SPEED_MIN = -5.0
+SPEED_MAX = 12.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pure Pursuit 설정
+# ══════════════════════════════════════════════════════════════════════════════
+PURE_PURSUIT_CONFIG = {
+    'wheelbase'                 : ENV_CONFIG['params']['lf'] + ENV_CONFIG['params']['lr'],
+
+    # 조향용 lookahead: 짧게 봐야 코너에서 조향각이 충분히 나옴
+    'min_lookahead'             : 0.3,
+    'max_lookahead'             : 1.0,
+    'lookahead_gain'            : 0.15,
+
+    # 속도 감속용: 멀리 있는 커브를 미리 보고 감속
+    'curvature_gain'            : 3.0,
+    'lookahead_window_base'     : 10,
+    'lookahead_window_speed_scale': 2,
+
+    # 곡률 샘플링 간격: window가 커져도 촘촘하게 곡률 계산
+    'curvature_sample_step'     : 2,
+
+    # 조향 중일 때 속도 회복을 막기 위한 감속 비율
+    'steering_speed_gain'       : 1.0,
+
+    'max_steering'              : ENV_CONFIG['params']['s_max'],
+    'smooth_alpha'              : 0.8,
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,6 +151,19 @@ QUANTIZED_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_quantized.pth'
 # ══════════════════════════════════════════════════════════════════════════════
 # 평가 설정
 # ══════════════════════════════════════════════════════════════════════════════
-EVAL_EPISODES = 10
-EVAL_MAX_STEPS = 1000
+EVAL_EPISODES     = 5
+EVAL_MAX_STEPS    = 15000
 QUANTIZE_EPISODES = 5
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 체크포인트 reward 설정
+# ══════════════════════════════════════════════════════════════════════════════
+REWARD_CONFIG = {
+    'num_checkpoints'      : 10,
+    'checkpoint_arrival'   : 100.0,
+    'speed_reward_scale'   : 50.0,
+    'collision_penalty'    : -1000.0,
+    'lap_completion_reward': 500.0,
+    'baseline_steps'       : 500,
+}
