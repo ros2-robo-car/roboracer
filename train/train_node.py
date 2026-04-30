@@ -5,17 +5,11 @@ SAC가 주행 라인과 목표 속도를 선택하고,
 Pure Pursuit가 선택된 라인을 추종하는 구조.
 
 reward 설계:
-- waypoint를 10개 체크포인트로 나눠서 통과 시에만 보상
-- 체크포인트 보상 = 도착 보상 + 구간 소요시간 보상 (빠를수록 높음)
-- 체크포인트 사이(매 스텝)에는 기본 checkpoint reward = 0
-- 충돌 페널티 = -1000
-
-수정 사항:
-- lap_counts 기반 wp/progress 계산 제거
-- lap_counts >= 2 종료 조건 제거
-- ForwardProgressTracker로 전진 진행량 계산
-- 시작 waypoint는 이미 방문한 것으로 보고 progress를 1부터 시작
-- waypoint_progress_reward가 설정되어 있으면 전진 progress_delta에 보상 추가
+- waypoint 전진마다 dense reward (waypoint_progress_reward)
+- 체크포인트 통과 시 도착 보상 + 구간 소요시간 보상
+- 충돌 페널티: curriculum 방식으로 에피소드에 따라 점진적 증가
+- 정지 페널티: 속도가 임계값 이하일 때 매 step 페널티
+- lap_completion_reward 제거
 """
 
 import os
@@ -57,14 +51,42 @@ BRAKE_GAIN = 1.0
 NUM_CHECKPOINTS           = REWARD_CONFIG['num_checkpoints']
 CHECKPOINT_ARRIVAL_REWARD = REWARD_CONFIG['checkpoint_arrival']
 SPEED_REWARD_SCALE        = REWARD_CONFIG['speed_reward_scale']
-COLLISION_PENALTY         = REWARD_CONFIG['collision_penalty']
-LAP_COMPLETION_REWARD     = REWARD_CONFIG['lap_completion_reward']
 BASELINE_STEPS            = REWARD_CONFIG.get('baseline_steps', 500)
+
+# ── 충돌 curriculum 설정 ─────────────────────────────────────────────────────
+COLLISION_PENALTY_START      = REWARD_CONFIG['collision_penalty_start']
+COLLISION_PENALTY_END        = REWARD_CONFIG['collision_penalty_end']
+COLLISION_CURRICULUM_EPISODES = REWARD_CONFIG['collision_curriculum_episodes']
+
+# ── 정지 페널티 설정 ─────────────────────────────────────────────────────────
+STALL_SPEED_THRESHOLD = REWARD_CONFIG['stall_speed_threshold']
+STALL_PENALTY         = REWARD_CONFIG['stall_penalty']
 
 # ── Forward progress 설정 ────────────────────────────────────────────────────
 MAX_LAPS = REWARD_CONFIG.get('max_laps', 2)
 MAX_FORWARD_WP_JUMP = REWARD_CONFIG.get('max_forward_wp_jump', 30)
-WAYPOINT_PROGRESS_REWARD = REWARD_CONFIG.get('waypoint_progress_reward', 0.0)
+WAYPOINT_PROGRESS_REWARD = REWARD_CONFIG.get('waypoint_progress_reward', 1.0)
+
+
+def get_collision_penalty(episode: int) -> float:
+    """
+    에피소드에 따라 충돌 페널티를 점진적으로 키운다.
+    초반에는 가볍게 → 후반에는 강하게.
+
+    예시 (기본 설정):
+        ep 0    → -1.0
+        ep 500  → -5.5
+        ep 1000 → -10.0
+        ep 1500 → -10.0 (이후 고정)
+    """
+    if episode >= COLLISION_CURRICULUM_EPISODES:
+        return COLLISION_PENALTY_END
+
+    ratio = episode / COLLISION_CURRICULUM_EPISODES
+    penalty = COLLISION_PENALTY_START + ratio * (
+        COLLISION_PENALTY_END - COLLISION_PENALTY_START
+    )
+    return penalty
 
 
 def build_checkpoint_indices(n_waypoints: int, num_checkpoints: int = None) -> list:
@@ -100,7 +122,7 @@ class CheckpointTracker:
         현재 nearest_idx가 다음 체크포인트를 통과했는지 확인한다.
 
         Returns:
-            (passed, segment_steps, is_lap_complete)
+            (passed, segment_steps, is_last_checkpoint)
         """
         if self.next_checkpoint >= len(self.checkpoint_indices):
             return False, 0, False
@@ -128,11 +150,6 @@ class ForwardProgressTracker:
     """
     lap_counts를 사용하지 않고 reference waypoint index 변화량으로
     전진 진행량을 누적한다.
-
-    - 앞으로 간 경우만 progress 증가
-    - 뒤로 간 경우 progress 감소 없음
-    - 한 step에서 너무 크게 튀는 nearest waypoint는 무시
-    - 시작 waypoint는 이미 방문한 것으로 보고 progress를 1부터 시작
     """
 
     def __init__(
@@ -161,7 +178,6 @@ class ForwardProgressTracker:
             self.reference_waypoints,
         )
 
-        # 시작 waypoint도 이미 밟은 것으로 본다.
         self.forward_progress = 1.0
         self.ignored_jump_count = 0
 
@@ -186,21 +202,16 @@ class ForwardProgressTracker:
 
         delta = nearest_idx - self.prev_idx
 
-        # 원형 waypoint wrap 보정
         if delta < -self.n_waypoints / 2:
             delta += self.n_waypoints
         elif delta > self.n_waypoints / 2:
             delta -= self.n_waypoints
 
-        # 앞으로 간 경우만 누적
         if 0 < delta <= self.max_forward_jump:
             self.forward_progress += delta
-
-        # 너무 큰 양의 jump는 nearest waypoint 튐으로 보고 무시
         elif delta > self.max_forward_jump:
             self.ignored_jump_count += 1
 
-        # 뒤로 간 경우는 progress 감소시키지 않음
         self.prev_idx = nearest_idx
 
         progress_delta = max(0.0, self.forward_progress - prev_progress)
@@ -225,10 +236,6 @@ class ForwardProgressTracker:
 
 # ── 브레이크 유틸리티 ─────────────────────────────────────────────────────────
 def apply_brake(current_speed: float, target_speed: float) -> float:
-    """
-    현재 속도가 목표보다 높으면 더 낮은 desired velocity를 반환하여
-    내부 PID가 감속하도록 유도한다.
-    """
     if current_speed > target_speed:
         diff = current_speed - target_speed
         cmd_speed = target_speed - BRAKE_GAIN * diff
@@ -382,17 +389,18 @@ def compute_reward(
     model: SAC,
     waypoints_lines: list,
     checkpoint_tracker: CheckpointTracker,
+    episode: int,
 ):
     """
-    체크포인트 기반 reward (시간 기반).
-
-    - 매 스텝: reward = 0 (스텝 카운트만 증가)
-    - 체크포인트 통과 시: 도착 보상 + 소요시간 보상 (빠를수록 높음)
-    - 한 바퀴 완주 시: 추가 보너스
-    - 충돌 시: 큰 페널티
+    reward 구성:
+    - 충돌: curriculum 기반 페널티 (에피소드에 따라 점진적 증가)
+    - 정지: 속도가 임계값 이하일 때 매 step 페널티
+    - 체크포인트 통과: 도착 보상 + 소요시간 보상
+    - waypoint 진행: 별도로 메인 루프에서 추가
     """
     x = float(obs_raw['poses_x'][0])
     y = float(obs_raw['poses_y'][0])
+    speed = abs(float(obs_raw['linear_vels_x'][0]))
     collision = bool(obs_raw['collisions'][0])
 
     line_idx = model.action_to_line_index(action)
@@ -401,24 +409,24 @@ def compute_reward(
     position = np.array([x, y], dtype=np.float32)
     nearest_idx = get_nearest_waypoint_idx(position, waypoints)
 
+    # 충돌: curriculum 페널티
     if collision:
-        return COLLISION_PENALTY, line_idx, nearest_idx
+        penalty = get_collision_penalty(episode)
+        return penalty, line_idx, nearest_idx
 
+    # 정지 페널티: 가만히 있으면 계속 깎임
+    stall_reward = STALL_PENALTY if speed < STALL_SPEED_THRESHOLD else 0.0
+
+    # 체크포인트 보상
     checkpoint_tracker.tick()
+    passed, segment_steps, is_last = checkpoint_tracker.check(nearest_idx)
 
-    passed, segment_steps, is_lap_complete = checkpoint_tracker.check(nearest_idx)
+    checkpoint_reward = 0.0
+    if passed:
+        time_ratio = max(0.0, 1.0 - segment_steps / BASELINE_STEPS)
+        checkpoint_reward = CHECKPOINT_ARRIVAL_REWARD + SPEED_REWARD_SCALE * time_ratio
 
-    if not passed:
-        return 0.0, line_idx, nearest_idx
-
-    # 빠를수록 높은 보상: 스텝이 적을수록 time_ratio가 높음
-    time_ratio = max(0.0, 1.0 - segment_steps / BASELINE_STEPS)
-
-    reward = CHECKPOINT_ARRIVAL_REWARD
-    reward += SPEED_REWARD_SCALE * time_ratio
-
-    if is_lap_complete:
-        reward += LAP_COMPLETION_REWARD
+    reward = stall_reward + checkpoint_reward
 
     return reward, line_idx, nearest_idx
 
@@ -430,19 +438,12 @@ def make_warmup_action(
     num_lines: int,
     controller: PurePursuitController,
 ) -> tuple:
-    """
-    Returns:
-        (sac_action, env_action)
-        - sac_action: replay buffer 저장용 [-1, 1]
-        - env_action: 실제 env.step용 [steering, speed] (브레이크 적용됨)
-    """
     x = float(obs_raw['poses_x'][0])
     y = float(obs_raw['poses_y'][0])
     heading = float(obs_raw['poses_theta'][0])
     current_speed = float(obs_raw['linear_vels_x'][0])
     position = np.array([x, y], dtype=np.float32)
 
-    # 가장 가까운 라인 찾기
     min_dist = float('inf')
     best_line = num_lines // 2
     for i, wp in enumerate(waypoints_lines):
@@ -452,23 +453,18 @@ def make_warmup_action(
             min_dist = dist
             best_line = i
 
-    # 약간의 탐색: 80%는 최적 라인, 20%는 랜덤 라인
     if np.random.rand() < 0.2:
         line_idx = np.random.randint(0, num_lines)
     else:
         line_idx = best_line
 
-    # Pure Pursuit으로 steering, speed 계산
     waypoints = waypoints_lines[line_idx]
     steering, pp_speed = controller.compute(x, y, heading, current_speed, waypoints)
 
-    # 브레이크 적용
     cmd_speed = apply_brake(current_speed, pp_speed)
 
-    # env action (브레이크 적용된 값)
     env_action = np.array([steering, cmd_speed], dtype=np.float32)
 
-    # SAC action (replay buffer용, 브레이크 전 목표속도 기준)
     if num_lines > 1:
         line_val = (line_idx / (num_lines - 1)) * 2.0 - 1.0
     else:
@@ -495,8 +491,6 @@ def build_model(obs_dim: int) -> SAC:
     )
 
 
-# 기존 코드 호환용으로 남겨둠.
-# 새 학습 로그/종료에는 ForwardProgressTracker를 사용한다.
 def get_wp_progress(obs_raw: dict, reference_waypoints: np.ndarray):
     x = float(obs_raw['poses_x'][0])
     y = float(obs_raw['poses_y'][0])
@@ -675,7 +669,7 @@ class Trainer:
             )
             progress_tracker.reset_from_obs(obs_raw)
 
-            eval_tracker = CheckpointTracker(n_wp)
+            eval_checkpoint = CheckpointTracker(n_wp)
 
             for _ in range(TRAIN_CONFIG['max_steps']):
                 action = self.model.select_action(obs, training=False)
@@ -690,9 +684,11 @@ class Trainer:
                     progress_tracker.update(next_obs_raw)
                 )
 
+                # 평가 시에는 최종 페널티 사용
                 reward, _, _ = compute_reward(
                     next_obs_raw, action, self.model,
-                    waypoints_lines, eval_tracker,
+                    waypoints_lines, eval_checkpoint,
+                    episode=COLLISION_CURRICULUM_EPISODES,
                 )
 
                 reward += WAYPOINT_PROGRESS_REWARD * progress_delta
@@ -766,10 +762,13 @@ def main():
     print(f'max_laps: {MAX_LAPS}')
     print(f'max_forward_wp_jump: {MAX_FORWARD_WP_JUMP}')
     print(f'waypoint_progress_reward: {WAYPOINT_PROGRESS_REWARD}')
+    print(f'stall_penalty: {STALL_PENALTY} (threshold: {STALL_SPEED_THRESHOLD} m/s)')
+    print(
+        f'collision curriculum: {COLLISION_PENALTY_START} → '
+        f'{COLLISION_PENALTY_END} over {COLLISION_CURRICULUM_EPISODES} eps'
+    )
     print(f'reward: 체크포인트 도착={CHECKPOINT_ARRIVAL_REWARD}, '
-          f'시간 스케일={SPEED_REWARD_SCALE}, '
-          f'충돌={COLLISION_PENALTY}, '
-          f'완주 보너스={LAP_COMPLETION_REWARD}\n')
+          f'시간 스케일={SPEED_REWARD_SCALE}\n')
 
     for episode in range(TRAIN_CONFIG['max_episodes']):
         obs_raw, _, _, _ = env.reset(poses=init_poses)
@@ -794,6 +793,7 @@ def main():
 
         checkpoint_tracker = CheckpointTracker(n_waypoints)
         prev_line_idx = 0
+        collisions = 0
 
         for _ in range(TRAIN_CONFIG['max_steps']):
             if total_steps < TRAIN_CONFIG['warmup_steps']:
@@ -813,7 +813,6 @@ def main():
                 )
 
             next_obs_raw, _, done, _ = env.step(np.array([env_action]))
-            # env.render()
 
             progress_score, progress_pct, forward_done, progress_delta = (
                 progress_tracker.update(next_obs_raw)
@@ -821,9 +820,13 @@ def main():
 
             speeds.append(abs(float(next_obs_raw['linear_vels_x'][0])))
 
+            if bool(next_obs_raw['collisions'][0]):
+                collisions += 1
+
             reward, prev_line_idx, _ = compute_reward(
                 next_obs_raw, action, trainer.model,
                 waypoints_lines, checkpoint_tracker,
+                episode=episode,
             )
 
             reward += WAYPOINT_PROGRESS_REWARD * progress_delta
@@ -849,13 +852,14 @@ def main():
                 break
 
         avg_speed = float(np.mean(speeds)) if speeds else 0.0
-        lap_count = int(obs_raw['lap_counts'][0])
+        current_penalty = get_collision_penalty(episode)
 
         print(
             f'ep {episode:5d} | '
             f'reward: {episode_reward:8.2f} | '
-            f'lap: {lap_count} | '
             f'cp: {checkpoint_tracker.checkpoints_passed}/{NUM_CHECKPOINTS} | '
+            f'crash: {collisions} | '
+            f'penalty: {current_penalty:.1f} | '
             f'speed: {avg_speed:.2f} | '
             f'line: {prev_line_idx} | '
             f'steps: {total_steps} | '

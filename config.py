@@ -162,12 +162,27 @@ QUANTIZE_EPISODES = 5
 # reward 설정
 # ══════════════════════════════════════════════════════════════════════════════
 REWARD_CONFIG = {
-    'num_checkpoints'      : 10,
-    'checkpoint_arrival'   : 100.0,
-    'speed_reward_scale'   : 50.0,
-    'collision_penalty'    : -1000.0,
-    'lap_completion_reward': 500.0,
-    'baseline_steps'       : 500,
+    # 체크포인트 설정
+    'num_checkpoints'     : 10,
+    'checkpoint_arrival'  : 10.0,
+    'speed_reward_scale'  : 5.0,
+    'baseline_steps'      : 500,
+
+    # 충돌 페널티 (curriculum)
+    'collision_penalty_start': -5.0,
+    'collision_penalty_end'  : -100.0,
+    'collision_curriculum_episodes': 100,
+
+    # 정지 페널티
+    'stall_speed_threshold': 0.3,
+    'stall_penalty'        : -0.5,
+
+    # waypoint 진행 보상 (dense)
+    'waypoint_progress_reward': 1.0,
+
+    # forward progress 설정
+    'max_laps'            : 2,
+    'max_forward_wp_jump' : 30,
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

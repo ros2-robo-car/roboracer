@@ -429,6 +429,7 @@ def main():
 
         obs_raw, _, _, _ = env.reset(poses=init_poses)
         obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
+        env.render()
 
         progress_tracker = ForwardProgressTracker(
             progress_reference_line,
