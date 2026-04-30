@@ -1,13 +1,17 @@
 """
 multimap_train.py
-─────────────────
-여러 맵을 순서대로 돌며 학습하는 멀티맵 학습 스크립트.
+
+여러 맵을 순서대로 돌며 학습하는 멀티맵 학습 스크립트
 
 현재 train_node.py 구조에 맞춘 버전:
 - ForwardProgressTracker 사용
-- WarmupBaselineCollector 사용하지 않음
-- baseline_segment_steps 사용하지 않음
-- compute_reward()는 기존 train_node.py 시그니처 유지
+- compute_reward()는 현재 train_node.py 시그니처 사용
+    reward, line_idx, nearest_idx =
+        compute_reward(..., episode=...)
+- 라인 점프 페널티 제거
+- 충돌 step에는 progress reward를 주지 않음
+- invalid next_obs 발생 시 penalty를 주고 terminal transition 저장
+- 평가 시에는 고정 충돌 penalty 사용
 """
 
 import os
@@ -48,15 +52,14 @@ from train_node import (
     make_warmup_action,
     make_init_pose,
     is_valid_obs,
+    get_collision_penalty,
     NUM_CHECKPOINTS,
     MAX_LAPS,
     MAX_FORWARD_WP_JUMP,
     WAYPOINT_PROGRESS_REWARD,
+    COLLISION_CURRICULUM_EPISODES,
+    INVALID_OBS_PENALTY_SCALE,
 )
-
-
-STEERING_CHANGE_PENALTY = REWARD_CONFIG.get('steering_change_penalty', 0.0)
-STEERING_CHANGE_THRESHOLD = REWARD_CONFIG.get('steering_change_threshold', 0.1)
 
 
 DEFAULT_FIXED_EVAL_MAPS = [
@@ -66,6 +69,15 @@ DEFAULT_FIXED_EVAL_MAPS = [
     'Austin',
     'Nuerburgring',
 ]
+
+
+def is_valid_transition(obs, action, reward, next_obs) -> bool:
+    return (
+        is_valid_obs(obs)
+        and is_valid_obs(next_obs)
+        and np.isfinite(action).all()
+        and np.isfinite(reward)
+    )
 
 
 def get_map_paths(map_name: str) -> dict:
@@ -97,6 +109,7 @@ def load_map_waypoints(map_paths: dict) -> dict:
             centerline_path=csv_path,
             num_lines=LINE_CONFIG['num_lines'],
             line_spacing=LINE_CONFIG['line_spacing'],
+            width_fraction=LINE_CONFIG.get('line_width_fraction', 0.60),
         )
 
     return load_waypoints(
@@ -104,6 +117,7 @@ def load_map_waypoints(map_paths: dict) -> dict:
         map_ext=map_paths['map_ext'],
         num_lines=LINE_CONFIG['num_lines'],
         line_spacing=LINE_CONFIG['line_spacing'],
+        width_fraction=LINE_CONFIG.get('line_width_fraction', 0.60),
     )
 
 
@@ -176,6 +190,7 @@ def run_episode(
     controller: PurePursuitController,
     is_warmup: bool,
     max_steps_ep: int,
+    episode_for_penalty: int,
 ) -> dict:
     map_name = map_data['map_name']
     waypoints_lines = map_data['waypoints_lines']
@@ -186,6 +201,24 @@ def run_episode(
 
     env_cfg = make_env_config(map_data['paths'])
     env = gym.make('f110_gym:f110-v0', **env_cfg)
+
+    episode_reward = 0.0
+    speeds = []
+    ep_steps = 0
+    lap_count = 0
+
+    progress_score = 1
+    progress_pct = (
+        progress_score / (n_waypoints * MAX_LAPS) * 100.0
+        if n_waypoints > 0
+        else 0.0
+    )
+
+    line_idx = -1
+    collisions = 0
+
+    progress_tracker = None
+    tracker = None
 
     try:
         obs_raw, _, _, _ = env.reset(poses=init_poses)
@@ -199,20 +232,6 @@ def run_episode(
         progress_tracker.reset_from_obs(obs_raw)
 
         tracker = CheckpointTracker(n_waypoints)
-
-        episode_reward = 0.0
-        speeds = []
-
-        prev_steering = 0.0
-        ep_steps = 0
-        line_idx = 0
-
-        progress_score = 1
-        progress_pct = (
-            progress_score / (n_waypoints * MAX_LAPS) * 100.0
-            if n_waypoints > 0
-            else 0.0
-        )
 
         for _ in range(max_steps_ep):
             if is_warmup:
@@ -241,31 +260,9 @@ def run_episode(
 
             next_obs_raw, _, done, _ = env.step(np.array([env_action]))
 
-            progress_score, progress_pct, forward_done, progress_delta = (
-                progress_tracker.update(next_obs_raw)
-            )
-
-            speeds.append(abs(float(next_obs_raw['linear_vels_x'][0])))
-
-            reward, line_idx, _ = compute_reward(
-                next_obs_raw,
-                action,
-                trainer.model,
-                waypoints_lines,
-                tracker,
-            )
-
-            reward += WAYPOINT_PROGRESS_REWARD * progress_delta
-
-            cur_steer = float(env_action[0])
-            steer_change = abs(cur_steer - prev_steering)
-
-            if steer_change > STEERING_CHANGE_THRESHOLD:
-                reward -= STEERING_CHANGE_PENALTY * (
-                    steer_change - STEERING_CHANGE_THRESHOLD
-                )
-
-            prev_steering = cur_steer
+            current_collision = bool(next_obs_raw['collisions'][0])
+            if current_collision:
+                collisions += 1
 
             next_obs = preprocess_obs(
                 next_obs_raw,
@@ -273,9 +270,55 @@ def run_episode(
                 num_lines,
             )
 
-            terminal = bool(done or forward_done)
+            if not is_valid_obs(next_obs):
+                invalid_penalty = (
+                    get_collision_penalty(episode_for_penalty)
+                    * INVALID_OBS_PENALTY_SCALE
+                )
+                reward = invalid_penalty
 
-            if is_valid_obs(obs) and is_valid_obs(next_obs):
+                if (
+                    is_valid_obs(obs)
+                    and np.isfinite(action).all()
+                    and np.isfinite(reward)
+                ):
+                    trainer.buffer.push(
+                        obs,
+                        action,
+                        reward,
+                        obs,
+                        1.0,
+                    )
+
+                episode_reward += float(reward)
+                ep_steps += 1
+
+                print('[WARN] invalid next_obs after env.step. apply penalty and terminate episode.')
+                break
+
+            progress_score, progress_pct, forward_done, progress_delta = (
+                progress_tracker.update(next_obs_raw)
+            )
+
+            speed_value = abs(float(next_obs_raw['linear_vels_x'][0]))
+            if np.isfinite(speed_value):
+                speeds.append(speed_value)
+
+            reward, line_idx, _ = compute_reward(
+                next_obs_raw,
+                action,
+                trainer.model,
+                waypoints_lines,
+                tracker,
+                episode=episode_for_penalty,
+            )
+
+            if not current_collision:
+                reward += WAYPOINT_PROGRESS_REWARD * progress_delta
+
+            terminal = bool(done or forward_done or current_collision)
+
+            if is_valid_transition(obs, action, reward, next_obs):
                 trainer.buffer.push(
                     obs,
                     action,
@@ -283,6 +326,8 @@ def run_episode(
                     next_obs,
                     float(terminal),
                 )
+            else:
+                print('[WARN] invalid transition skipped.')
 
             obs = next_obs
             obs_raw = next_obs_raw
@@ -301,11 +346,23 @@ def run_episode(
     finally:
         env.close()
 
+    ignored_jump = (
+        progress_tracker.ignored_jump_count
+        if progress_tracker is not None
+        else 0
+    )
+
+    cp_passed = (
+        tracker.checkpoints_passed
+        if tracker is not None
+        else 0
+    )
+
     return {
         'map_name': map_name,
         'reward': episode_reward,
         'lap_count': lap_count,
-        'cp_passed': tracker.checkpoints_passed,
+        'cp_passed': cp_passed,
         'cp_total': NUM_CHECKPOINTS,
         'avg_speed': avg_speed,
         'line_idx': line_idx,
@@ -313,7 +370,8 @@ def run_episode(
         'progress_score': progress_score,
         'progress_pct': progress_pct,
         'n_waypoints': n_waypoints,
-        'ignored_jump': progress_tracker.ignored_jump_count,
+        'ignored_jump': ignored_jump,
+        'crash': collisions,
     }
 
 
@@ -326,6 +384,7 @@ def print_episode(tag: str, ep: int, r: dict, total_steps: int):
         f'reward: {r["reward"]:8.2f} | '
         f'lap: {r["lap_count"]} | '
         f'cp: {r["cp_passed"]:2d}/{r["cp_total"]} | '
+        f'crash: {r["crash"]} | '
         f'speed: {r["avg_speed"]:.2f} | '
         f'line: {r["line_idx"]} | '
         f'steps: {total_steps} | '
@@ -354,6 +413,8 @@ def run_evaluation(
             env_cfg = make_env_config(map_data['paths'])
             env = gym.make('f110_gym:f110-v0', **env_cfg)
 
+            episode_reward = 0.0
+
             try:
                 obs_raw, _, _, _ = env.reset(poses=map_data['init_poses'])
                 obs = preprocess_obs(
@@ -371,11 +432,9 @@ def run_evaluation(
 
                 eval_tracker = CheckpointTracker(map_data['n_waypoints'])
 
-                episode_reward = 0.0
-                prev_steering = 0.0
-
                 for _ in range(max_steps_ep):
                     if not is_valid_obs(obs):
+                        print('[WARN][eval] invalid obs before select_action. terminate episode.')
                         break
 
                     action = trainer.model.select_action(
@@ -395,40 +454,45 @@ def run_evaluation(
                         np.array([env_action])
                     )
 
-                    progress_score, _, forward_done, progress_delta = (
-                        progress_tracker.update(next_obs_raw)
-                    )
+                    current_collision = bool(next_obs_raw['collisions'][0])
 
-                    reward, _, _ = compute_reward(
-                        next_obs_raw,
-                        action,
-                        trainer.model,
-                        map_data['waypoints_lines'],
-                        eval_tracker,
-                    )
-
-                    reward += WAYPOINT_PROGRESS_REWARD * progress_delta
-
-                    cur_steer = float(env_action[0])
-                    steer_change = abs(cur_steer - prev_steering)
-
-                    if steer_change > STEERING_CHANGE_THRESHOLD:
-                        reward -= STEERING_CHANGE_PENALTY * (
-                            steer_change - STEERING_CHANGE_THRESHOLD
-                        )
-
-                    prev_steering = cur_steer
-
-                    obs = preprocess_obs(
+                    next_obs = preprocess_obs(
                         next_obs_raw,
                         map_data['waypoints_lines'],
                         num_lines,
                     )
 
+                    if not is_valid_obs(next_obs):
+                        invalid_penalty = (
+                            get_collision_penalty(COLLISION_CURRICULUM_EPISODES)
+                            * INVALID_OBS_PENALTY_SCALE
+                        )
+                        episode_reward += float(invalid_penalty)
+
+                        print('[WARN][eval] invalid next_obs. apply penalty and terminate episode.')
+                        break
+
+                    _, _, forward_done, progress_delta = (
+                        progress_tracker.update(next_obs_raw)
+                    )
+
+                    reward, line_idx, _ = compute_reward(
+                        next_obs_raw,
+                        action,
+                        trainer.model,
+                        map_data['waypoints_lines'],
+                        eval_tracker,
+                        episode=COLLISION_CURRICULUM_EPISODES,
+                    )
+
+                    if not current_collision:
+                        reward += WAYPOINT_PROGRESS_REWARD * progress_delta
+
+                    obs = next_obs
                     obs_raw = next_obs_raw
                     episode_reward += float(reward)
 
-                    if done or forward_done:
+                    if done or forward_done or current_collision:
                         break
 
                 total_reward += episode_reward
@@ -527,6 +591,7 @@ def main():
                 controller=controller,
                 is_warmup=True,
                 max_steps_ep=max_steps_ep,
+                episode_for_penalty=total_episodes,
             )
 
             total_steps += result['ep_steps']
@@ -539,6 +604,10 @@ def main():
                 result,
                 total_steps,
             )
+
+            if result['ep_steps'] <= 0:
+                print('[WARN] episode step is 0. break warmup loop to avoid infinite loop.')
+                break
 
         print(
             f'Warmup 완료 | '
@@ -563,6 +632,7 @@ def main():
                 controller=controller,
                 is_warmup=False,
                 max_steps_ep=max_steps_ep,
+                episode_for_penalty=total_episodes,
             )
 
             total_steps += result['ep_steps']
@@ -575,6 +645,10 @@ def main():
                 result,
                 total_steps,
             )
+
+            if result['ep_steps'] <= 0:
+                print('[WARN] episode step is 0. break train loop to avoid infinite loop.')
+                break
 
         print(
             f'학습 완료 | '

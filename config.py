@@ -68,6 +68,9 @@ OBS_CONFIG = {
 LINE_CONFIG = {
     'num_lines'     : 5,
     'line_spacing'  : 0.15,
+    'line_width_fraction': 0.45,
+    'line_safety_margin': 0.20,
+    
     'centerline_csv': CENTERLINE_CSV,
     'map_path'      : MAP_PATH,
     'map_ext'       : MAP_EXT,
@@ -75,6 +78,7 @@ LINE_CONFIG = {
     'start_line_idx'     : None,   # None이면 가운데 line 사용
     'start_wp_idx'       : 0,      # 몇 번째 waypoint에서 시작할지
     'start_lookahead_idx': 5,
+    
 }
 
 
@@ -103,7 +107,7 @@ TRAIN_CONFIG = {
     'max_episodes' : 5000,
     'max_steps'    : 15000,
     'eval_interval': 5,
-    'warmup_steps' : 20000,
+    'warmup_steps' : 30000,
 }
 
 
@@ -162,25 +166,25 @@ QUANTIZE_EPISODES = 5
 # reward 설정
 # ══════════════════════════════════════════════════════════════════════════════
 REWARD_CONFIG = {
-    # 체크포인트 설정
     'num_checkpoints'     : 10,
-    'checkpoint_arrival'  : 10.0,
+    'checkpoint_arrival'  : 20.0,
     'speed_reward_scale'  : 5.0,
     'baseline_steps'      : 500,
 
-    # 충돌 페널티 (curriculum)
-    'collision_penalty_start': -5.0,
-    'collision_penalty_end'  : -100.0,
-    'collision_curriculum_episodes': 100,
+    'collision_penalty_start': -20.0,
+    'collision_penalty_end'  : -200.0,
+    'collision_curriculum_episodes': 200,
 
-    # 정지 페널티
     'stall_speed_threshold': 0.3,
-    'stall_penalty'        : -0.5,
+    'stall_penalty'        : -0.05,
 
-    # waypoint 진행 보상 (dense)
-    'waypoint_progress_reward': 1.0,
+    'waypoint_progress_reward': 0.5,
+    'no_progress_check_interval': 20,
+    'no_progress_min_delta': 1.0,
+    'no_progress_penalty': -1.0,
+    'no_progress_patience': 4,
+    'no_progress_terminal_penalty': -50.0,
 
-    # forward progress 설정
     'max_laps'            : 2,
     'max_forward_wp_jump' : 30,
 }

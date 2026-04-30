@@ -429,7 +429,6 @@ def main():
 
         obs_raw, _, _, _ = env.reset(poses=init_poses)
         obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
-        env.render()
 
         progress_tracker = ForwardProgressTracker(
             progress_reference_line,
@@ -451,7 +450,7 @@ def main():
 
             env_action = np.array([[steering, target_speed]], dtype=np.float32)
             next_obs_raw, _, done, _ = env.step(env_action)
-            # env.render()
+            env.render()
 
             progress_score, progress_pct, forward_done, _ = (
                 progress_tracker.update(next_obs_raw)
