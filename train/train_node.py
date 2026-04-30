@@ -239,7 +239,7 @@ def apply_brake(current_speed: float, target_speed: float) -> float:
     if current_speed > target_speed:
         diff = current_speed - target_speed
         cmd_speed = target_speed - BRAKE_GAIN * diff
-        cmd_speed = max(cmd_speed, -SPEED_MAX)
+        cmd_speed = max(cmd_speed, SPEED_MIN)
         return cmd_speed
     else:
         return target_speed
