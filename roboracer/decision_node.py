@@ -1,7 +1,8 @@
 """
-decision_node.py (라인 선택 버전)
-─────────────────────────────────
+decision_node.py (Hybrid SAC 버전)
+──────────────────────────────────
 설정은 config.py에서 관리
+
 """
 
 import os
@@ -84,6 +85,7 @@ class DecisionNode(Node):
         if len(obs) != OBS_DIM or not self.odom_received or self.waypoints_lines is None:
             return
 
+        # Hybrid SAC: action = [line_idx(정수), speed_val(-1~1)]
         action = self.model.select_action(obs, training=False)
         line_idx = self.model.action_to_line_index(action)
         waypoints = self.waypoints_lines[line_idx]

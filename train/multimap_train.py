@@ -247,8 +247,8 @@ def run_episode(
                     break
 
                 action = trainer.model.select_action(obs, training=True)
-                action = action + np.random.normal(0, 0.1, size=action.shape)
-                action = np.clip(action, -1.0, 1.0)
+                speed_noise = np.random.normal(0, 0.05)
+                action[1] = float(np.clip(action[1] + speed_noise, -1.0, 1.0))
 
                 env_action = action_to_env(
                     action,

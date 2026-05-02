@@ -1,7 +1,7 @@
 """
-train_node.py
+train_node.py (Hybrid SAC 버전)
 
-SAC가 주행 라인과 목표 속도를 선택하고,
+SAC가 주행 라인(이산)과 목표 속도(연속)를 선택하고,
 Pure Pursuit가 선택된 라인을 추종하는 구조.
 
 reward 설계:
@@ -41,7 +41,7 @@ from config import (
     MODEL_SAVE_PATH,
 )
 
-from sac_model import SAC, build_observation, get_obs_dim
+from sac_model import SAC, build_observation, get_obs_dim, encode_action
 from waypoint_loader import load_waypoints, get_nearest_waypoint_idx
 from pure_pursuit import PurePursuitController
 
@@ -85,7 +85,7 @@ NO_PROGRESS_PENALTY = REWARD_CONFIG.get('no_progress_penalty', -1.0)
 NO_PROGRESS_PATIENCE = REWARD_CONFIG.get('no_progress_patience', 4)
 NO_PROGRESS_TERMINAL_PENALTY = REWARD_CONFIG.get(
     'no_progress_terminal_penalty',
-    -50.0,
+    -1000.0,
 )
 
 
@@ -465,6 +465,10 @@ def make_warmup_action(
     num_lines: int,
     controller: PurePursuitController,
 ) -> tuple:
+    """
+    Hybrid SAC용 warmup action 생성.
+    action = [line_idx(정수), speed_val(-1~1)]
+    """
     x = float(obs_raw['poses_x'][0])
     y = float(obs_raw['poses_y'][0])
     heading = float(obs_raw['poses_theta'][0])
@@ -494,11 +498,6 @@ def make_warmup_action(
     cmd_speed = apply_brake(current_speed, pp_speed)
     env_action = np.array([steering, cmd_speed], dtype=np.float32)
 
-    if num_lines > 1:
-        line_val = (line_idx / (num_lines - 1)) * 2.0 - 1.0
-    else:
-        line_val = 0.0
-
     # warmup buffer에 들어갈 speed action도 SAC 목표 속도 범위와 맞춘다.
     speed_val = (
         (pp_speed - TARGET_SPEED_MIN)
@@ -506,7 +505,8 @@ def make_warmup_action(
     ) * 2.0 - 1.0
     speed_val = float(np.clip(speed_val, -1.0, 1.0))
 
-    sac_action = np.array([line_val, speed_val], dtype=np.float32)
+    # Hybrid SAC: line_idx는 정수, speed_val은 연속값
+    sac_action = np.array([float(line_idx), speed_val], dtype=np.float32)
 
     return sac_action, env_action
 
@@ -555,6 +555,9 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=max_size)
 
     def push(self, obs, action, reward, next_obs, done):
+        """
+        action: [line_idx(정수), speed_val(-1~1)]
+        """
         self.buffer.append((obs, action, reward, next_obs, done))
 
     def sample(self, batch_size: int):
@@ -603,7 +606,12 @@ class Trainer:
             lr=TRAIN_CONFIG['lr_critic'],
         )
 
-        self.target_entropy = -MODEL_CONFIG['action_dim'] * 0.5
+        # target entropy: 이산(라인) + 연속(속도) 합산
+        # 연속 부분: -action_dim_continuous = -1
+        # 이산 부분: -log(1/num_lines) 정도 (최대 엔트로피의 일부)
+        continuous_entropy = -1.0 * 0.5
+        discrete_entropy = -np.log(1.0 / MODEL_CONFIG['num_lines']) * 0.5
+        self.target_entropy = continuous_entropy + discrete_entropy
 
         self.log_alpha = torch.zeros(
             1,
@@ -626,48 +634,85 @@ class Trainer:
         )
 
         obs = obs.to(self.device)
-        action = action.to(self.device)
+        action = action.to(self.device)         # (batch, 2): [line_idx, speed_val]
         reward = reward.to(self.device).clamp(REWARD_CLAMP_MIN, REWARD_CLAMP_MAX)
         next_obs = next_obs.to(self.device)
         done = done.to(self.device)
 
+        num_lines = self.model.num_lines
         gamma = TRAIN_CONFIG['gamma']
         tau = TRAIN_CONFIG['tau']
 
-        with torch.no_grad():
-            next_action, next_log_prob = self.model.actor.sample(next_obs)
+        # buffer의 action에서 line_idx, speed 분리
+        buf_line_idx = action[:, 0].long()      # (batch,)
+        buf_speed = action[:, 1].unsqueeze(1)   # (batch, 1)
 
-            target_q1 = self.model.target_critic1(next_obs, next_action)
-            target_q2 = self.model.target_critic2(next_obs, next_action)
-            target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_prob
+        # Critic에 넣을 action 인코딩: [onehot(line), speed]
+        buf_action_encoded = encode_action(
+            buf_line_idx, buf_speed, num_lines, self.device
+        )
+
+        # ── Critic 학습 ──
+        with torch.no_grad():
+            # next state에서 actor가 선택할 action
+            next_line_idx, next_speed, next_log_prob, _ = (
+                self.model.actor.sample(next_obs)
+            )
+
+            next_action_encoded = encode_action(
+                next_line_idx, next_speed, num_lines, self.device
+            )
+
+            target_q1 = self.model.target_critic1(next_obs, next_action_encoded)
+            target_q2 = self.model.target_critic2(next_obs, next_action_encoded)
+            target_q = (
+                torch.min(target_q1, target_q2)
+                - self.alpha * next_log_prob
+            )
 
             target_q = reward + (1.0 - done) * gamma * target_q
 
-        critic1_loss = F.mse_loss(self.model.critic1(obs, action), target_q)
+        critic1_loss = F.mse_loss(
+            self.model.critic1(obs, buf_action_encoded), target_q
+        )
         self.critic1_opt.zero_grad()
         critic1_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.critic1.parameters(), GRAD_CLIP_NORM)
+        torch.nn.utils.clip_grad_norm_(
+            self.model.critic1.parameters(), GRAD_CLIP_NORM
+        )
         self.critic1_opt.step()
 
-        critic2_loss = F.mse_loss(self.model.critic2(obs, action), target_q)
+        critic2_loss = F.mse_loss(
+            self.model.critic2(obs, buf_action_encoded), target_q
+        )
         self.critic2_opt.zero_grad()
         critic2_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.critic2.parameters(), GRAD_CLIP_NORM)
+        torch.nn.utils.clip_grad_norm_(
+            self.model.critic2.parameters(), GRAD_CLIP_NORM
+        )
         self.critic2_opt.step()
 
-        new_action, log_prob = self.model.actor.sample(obs)
+        # ── Actor 학습 ──
+        new_line_idx, new_speed, log_prob, _ = self.model.actor.sample(obs)
 
-        q1_new = self.model.critic1(obs, new_action)
-        q2_new = self.model.critic2(obs, new_action)
+        new_action_encoded = encode_action(
+            new_line_idx, new_speed, num_lines, self.device
+        )
+
+        q1_new = self.model.critic1(obs, new_action_encoded)
+        q2_new = self.model.critic2(obs, new_action_encoded)
         q_new = torch.min(q1_new, q2_new)
 
         actor_loss = (self.alpha * log_prob - q_new).mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.actor.parameters(), GRAD_CLIP_NORM)
+        torch.nn.utils.clip_grad_norm_(
+            self.model.actor.parameters(), GRAD_CLIP_NORM
+        )
         self.actor_opt.step()
 
+        # ── Alpha (온도) 학습 ──
         alpha_loss = -(
             self.log_alpha * (log_prob + self.target_entropy).detach()
         ).mean()
@@ -678,6 +723,7 @@ class Trainer:
 
         self.alpha = self.log_alpha.exp()
 
+        # ── Target Critic 소프트 업데이트 ──
         for critic, target_critic in [
             (self.model.critic1, self.model.target_critic1),
             (self.model.critic2, self.model.target_critic2),
@@ -788,60 +834,32 @@ class Trainer:
                 if done or forward_done or current_collision or no_progress_done:
                     break
 
-        return total_reward / n_episodes
-
-    def save(self, path: str):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-
-        torch.save(
-            {
-                'model_state': self.model.state_dict(),
-                'model_config': MODEL_CONFIG,
-                'obs_config': OBS_CONFIG,
-                'line_config': LINE_CONFIG,
-            },
-            path,
-        )
-
-        print(f'모델 저장: {path}')
-
-    def load(self, path: str):
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state'])
-        print(f'모델 로드: {path}')
+        return total_reward / max(n_episodes, 1)
 
 
-# ── 메인 ──────────────────────────────────────────────────────────────────────
+# ── 메인 학습 루프 ────────────────────────────────────────────────────────────
 def main():
-    env = gym.make('f110_gym:f110-v0', **ENV_CONFIG)
-
     num_lines = MODEL_CONFIG['num_lines']
+    obs_dim = get_obs_dim(OBS_CONFIG['lidar_size'], num_lines)
+
+    env = gym.make('f110_gym:f110-v0', **ENV_CONFIG)
 
     wp = load_racing_lines()
     waypoints_lines = wp['lines']
+    n_waypoints = len(waypoints_lines[0])
 
     progress_reference_line = waypoints_lines[num_lines // 2]
-    n_waypoints = len(progress_reference_line)
 
-    controller = PurePursuitController(
-        max_speed=SPEED_MAX,
-        min_speed=TARGET_SPEED_MIN,
-    )
-
-    obs_dim = get_obs_dim(OBS_CONFIG['lidar_size'], num_lines)
-    trainer = Trainer(obs_dim)
-
-    best_reward = -float('inf')
-    total_steps = 0
+    controller = PurePursuitController(max_speed=SPEED_MAX, min_speed=SPEED_MIN)
 
     init_poses = make_init_pose(waypoints_lines)
 
-    cp_indices = build_checkpoint_indices(n_waypoints)
-    print(f'\n체크포인트 {NUM_CHECKPOINTS}개 설정: {cp_indices}')
-    print(f'총 waypoint 수: {n_waypoints}')
+    trainer = Trainer(obs_dim)
+    best_reward = -float('inf')
+    total_steps = 0
 
     print(
-        f'\n학습 시작 | map: {ENV_CONFIG["map"]} | '
+        f'\n학습 시작 | '
         f'obs_dim: {obs_dim} | lines: {num_lines}'
     )
     print(f'브레이크 명령 하한 SPEED_MIN: {SPEED_MIN}')
@@ -891,13 +909,10 @@ def main():
 
                 action = trainer.model.select_action(obs, training=True)
 
-                # line action에는 noise를 주지 않고, speed action에만 noise를 준다.
-                noise = np.array(
-                    [0.0, np.random.normal(0, 0.05)],
-                    dtype=np.float32,
-                )
-                action = action + noise
-                action = np.clip(action, -1.0, 1.0)
+                # Hybrid SAC: 라인은 이산이므로 noise 불필요
+                # 속도에만 noise 추가
+                speed_noise = np.random.normal(0, 0.05)
+                action[1] = float(np.clip(action[1] + speed_noise, -1.0, 1.0))
 
                 env_action = action_to_env(
                     action, obs_raw, trainer.model, waypoints_lines, controller,
@@ -951,7 +966,7 @@ def main():
                     f'({progress_pct:.1f}%) | '
                     f'speed={abs(float(next_obs_raw["linear_vels_x"][0])):.2f} | '
                     f'line={line_idx} | '
-                    f'action={np.round(action, 3)} | '
+                    f'action=[line={int(action[0])}, spd={action[1]:.3f}] | '
                     f'env_action={np.round(env_action, 3)}'
                 )
 
@@ -975,8 +990,7 @@ def main():
                     progress_window_steps = 0
 
                 if no_progress_bad_count >= NO_PROGRESS_PATIENCE:
-                    # no-progress 종료는 충돌과 같은 수준의 실패로 취급
-                    reward += get_collision_penalty(episode)
+                    reward += NO_PROGRESS_TERMINAL_PENALTY
                     no_progress_done = True
                     no_progress_done_count += 1
 
@@ -1001,44 +1015,57 @@ def main():
             else:
                 print('[WARN] invalid transition skipped.')
 
-            obs = next_obs
-            obs_raw = next_obs_raw
             episode_reward += float(reward)
             total_steps += 1
 
             if total_steps >= TRAIN_CONFIG['warmup_steps']:
                 trainer.update()
 
+            obs = next_obs
+            obs_raw = next_obs_raw
+
             if terminal:
                 break
 
         avg_speed = float(np.mean(speeds)) if speeds else 0.0
-        current_penalty = get_collision_penalty(episode)
 
         print(
-            f'ep {episode:5d} | '
-            f'reward: {episode_reward:8.2f} | '
-            f'crash: {collisions} | '
-            f'penalty: {current_penalty:.1f} | '
-            f'speed: {avg_speed:.2f} | '
-            f'line: {last_line_idx} | '
-            f'no_prog_bad: {no_progress_bad_count} | '
-            f'no_prog_done: {no_progress_done_count} | '
-            f'steps: {total_steps} | '
+            f'ep {episode:4d} | '
+            f'reward: {episode_reward:8.1f} | '
             f'wp: {progress_score}/{n_waypoints * MAX_LAPS} '
             f'({progress_pct:.1f}%) | '
+            f'speed: {avg_speed:.2f} | '
+            f'line: {last_line_idx} | '
+            f'crash: {collisions} | '
+            f'steps: {total_steps}'
         )
 
-        if episode % TRAIN_CONFIG['eval_interval'] == 0 and episode > 0:
+        if (
+            episode > 0
+            and episode % TRAIN_CONFIG['eval_interval'] == 0
+        ):
             eval_reward = trainer.evaluate(
                 env, waypoints_lines, controller, init_poses,
             )
 
-            print(f'[평가] ep {episode} | eval reward: {eval_reward:.2f}')
+            print(f'  [EVAL] reward: {eval_reward:.1f} (best: {best_reward:.1f})')
 
-            if eval_reward >= best_reward:
+            if eval_reward > best_reward:
                 best_reward = eval_reward
-                trainer.save(MODEL_SAVE_PATH)
+                os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
+
+                torch.save(
+                    {
+                        'model_state': trainer.model.state_dict(),
+                        'model_config': {
+                            'action_dim': MODEL_CONFIG['action_dim'],
+                            'hidden_dims': MODEL_CONFIG['hidden_dims'],
+                            'num_lines': MODEL_CONFIG['num_lines'],
+                        },
+                    },
+                    MODEL_SAVE_PATH,
+                )
+                print(f'  모델 저장: {MODEL_SAVE_PATH}')
 
     env.close()
     print('\n학습 완료')
