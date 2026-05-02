@@ -49,11 +49,14 @@ class HybridActor(nn.Module):
         x = self.net(state)
 
         line_logits = self.line_logits_layer(x)
-
-        speed_mean    = self.speed_mean_layer(x)
+        line_logits = torch.clamp(line_logits, -10, 10)  # 추가
+    
+        speed_mean = self.speed_mean_layer(x)
+        speed_mean = torch.clamp(speed_mean, -5, 5)      # 추가
+    
         speed_log_std = self.speed_log_std_layer(x)
         speed_log_std = torch.clamp(speed_log_std, LOG_STD_MIN, LOG_STD_MAX)
-
+    
         return line_logits, speed_mean, speed_log_std
 
     def sample(self, state):
