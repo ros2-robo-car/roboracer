@@ -11,7 +11,7 @@ import os
 # ══════════════════════════════════════════════════════════════════════════════
 # 맵 설정 (여기만 바꾸면 전체 적용)
 # ══════════════════════════════════════════════════════════════════════════════
-MAP_NAME = 'Spielberg'    # 사용할 맵 이름
+MAP_NAME = 'YasMarina'    # 사용할 맵 이름
 
 RACETRACKS_DIR = os.path.expanduser('~/f1tenth_racetracks')
 MAP_DIR        = os.path.join(RACETRACKS_DIR, MAP_NAME)
@@ -97,7 +97,7 @@ MODEL_CONFIG = {
 # 학습 설정
 # ══════════════════════════════════════════════════════════════════════════════
 TRAIN_CONFIG = {
-    'buffer_size'  : 100000,
+    'buffer_size'  : 1000000,
     'batch_size'   : 256,
     'gamma'        : 0.99,
     'tau'          : 0.005,
@@ -107,7 +107,7 @@ TRAIN_CONFIG = {
     'max_episodes' : 5000,
     'max_steps'    : 15000,
     'eval_interval': 5,
-    'warmup_steps' : 30000,
+    'warmup_steps' : 50000,
 }
 
 
@@ -129,7 +129,7 @@ PURE_PURSUIT_CONFIG = {
     'lookahead_gain'            : 0.15,
 
     # 속도 감속용: 멀리 있는 커브를 미리 보고 감속
-    'curvature_gain'            : 3.0,
+    'curvature_gain'            : 2.0,
     'lookahead_window_base'     : 5,
     'lookahead_window_speed_scale': 2,
 
@@ -137,7 +137,7 @@ PURE_PURSUIT_CONFIG = {
     'curvature_sample_step'     : 2,
 
     # 조향 중일 때 속도 회복을 막기 위한 감속 비율
-    'steering_speed_gain'       : 1.0,
+    'steering_speed_gain'       : 4.0,
 
     'max_steering'              : ENV_CONFIG['params']['s_max'],
     'smooth_alpha'              : 0.8,
@@ -158,7 +158,7 @@ QUANTIZED_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_quantized.pth'
 # 평가 설정
 # ══════════════════════════════════════════════════════════════════════════════
 EVAL_EPISODES     = 5
-EVAL_MAX_STEPS    = 15000
+EVAL_MAX_STEPS    = 20000
 QUANTIZE_EPISODES = 5
 
 
@@ -167,35 +167,42 @@ QUANTIZE_EPISODES = 5
 # ══════════════════════════════════════════════════════════════════════════════
 REWARD_CONFIG = {
     'num_checkpoints'     : 10,
-    'checkpoint_arrival'  : 20.0,
-    'speed_reward_scale'  : 5.0,
-    'baseline_steps'      : 500,
+    'checkpoint_arrival'  : 5.0,
+    'speed_reward_scale'  : 10.0,
+    'baseline_steps': 500,
+    'warmup_baseline_min_samples': 3,
 
-    'collision_penalty_start': -20.0,
-    'collision_penalty_end'  : -200.0,
-    'collision_curriculum_episodes': 200,
+    'collision_penalty_start': -100.0,
+    'collision_penalty_end'  : -100.0,
+    'collision_curriculum_episodes': 100,
 
-    'stall_speed_threshold': 0.3,
-    'stall_penalty'        : -0.05,
+    'waypoint_progress_reward': 0.05,
 
-    'waypoint_progress_reward': 0.5,
-    'no_progress_check_interval': 20,
+    'no_progress_check_interval': 100,
     'no_progress_min_delta': 1.0,
-    'no_progress_penalty': -1.0,
+    'no_progress_penalty': -0.5,
     'no_progress_patience': 4,
-    'no_progress_terminal_penalty': -50.0,
+    'no_progress_terminal_penalty': -100.0,
+
+    'timeout_penalty_scale': -100.0,
 
     'max_laps'            : 2,
     'max_forward_wp_jump' : 30,
-}
 
+    'steer_speed_threshold': 8.0,
+    'steer_deadzone': 0.25,
+    'steer_penalty': 0.05,
+
+    'brake_speed_threshold': 7.0,
+    'brake_penalty': 0.02,
+}
 # ══════════════════════════════════════════════════════════════════════════════
 # 멀티맵 학습 설정
 # ══════════════════════════════════════════════════════════════════════════════
 MULTIMAP_CONFIG = {
     'num_cycles'        : 25,       # 총 사이클 수
-    'warmup_steps'      : 30000,    # 사이클당 warmup 스텝
-    'train_steps'       : 75000,    # 사이클당 학습 스텝
+    'warmup_steps'      : 50000,    # 사이클당 warmup 스텝
+    'train_steps'       : 100000,    # 사이클당 학습 스텝
     'max_steps_per_ep'  : 15000,     # 에피소드당 최대 스텝
     'eval_episodes'     : 1,        # 평가 시 에피소드 수
 }
