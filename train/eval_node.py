@@ -1,18 +1,25 @@
 """
 eval_node.py
 
-학습된 SAC 모델 평가 코드.
+학습된 Hybrid SAC 모델 평가 코드.
 SAC는 주행 라인과 목표 속도를 선택하고,
 Pure Pursuit는 선택된 라인을 따라가기 위한 조향각을 계산한다.
 
-수정 사항:
-- lap_counts 기반 progress_score 제거
-- ForwardProgressTracker로 wp 진행률 계산
-- 종료 조건에서 lap_counts >= 2 제거
+종료 조건:
+- collision       : 충돌 발생
+- env_done        : f1tenth_gym 환경에서 done=True 반환
+- forward_done    : ForwardProgressTracker 기준 목표 lap 수 완료
+- no_progress     : 일정 구간 동안 waypoint 진행이 부족하여 강제 종료
+- max_steps       : EVAL_MAX_STEPS 도달
+
+출력:
+- 각 episode 종료 시 [END] 로그로 종료 이유 표시
+- episode별 평균 속도, 라인 오차, 라인 전환 횟수, 진행률 표시
 """
 
 import os
 import sys
+from collections import Counter
 
 import gym
 import f110_gym
@@ -39,15 +46,49 @@ from waypoint_loader import load_waypoints, get_nearest_waypoint_idx
 from pure_pursuit import PurePursuitController
 
 
+# ── 평가 / 진행 설정 ─────────────────────────────────────────────────────────
 MAX_LAPS = REWARD_CONFIG.get('max_laps', 2)
 MAX_FORWARD_WP_JUMP = REWARD_CONFIG.get('max_forward_wp_jump', 30)
+
+# SAC / Pure Pursuit가 선택하는 "목표 속도"의 최소값
+# SPEED_MIN은 브레이크 명령 하한값으로만 사용한다.
+TARGET_SPEED_MIN = REWARD_CONFIG.get('target_speed_min', 0.5)
+
+# no-progress 종료 조건
+NO_PROGRESS_CHECK_INTERVAL = REWARD_CONFIG.get('no_progress_check_interval', 100)
+NO_PROGRESS_MIN_DELTA = REWARD_CONFIG.get('no_progress_min_delta', 1.0)
+NO_PROGRESS_PATIENCE = REWARD_CONFIG.get('no_progress_patience', 3)
+
+
+# ── 브레이크 설정 ─────────────────────────────────────────────────────────────
+BRAKE_GAIN = 1.0
+
+
+def apply_brake(current_speed: float, target_speed: float) -> float:
+    """
+    현재 속도가 목표 속도보다 높으면 command speed를 낮춰 감속 유도.
+    SPEED_MIN은 실제 환경에 넣는 command speed의 하한값.
+    """
+    if current_speed > target_speed:
+        diff = current_speed - target_speed
+        cmd_speed = target_speed - BRAKE_GAIN * diff
+        cmd_speed = max(cmd_speed, SPEED_MIN)
+        return cmd_speed
+
+    return target_speed
 
 
 # ── 전처리 ────────────────────────────────────────────────────────────────────
 def preprocess_lidar(obs_raw: dict) -> np.ndarray:
     lidar = obs_raw['scans'][0].astype(np.float32)
 
-    lidar = np.where(np.isfinite(lidar), lidar, OBS_CONFIG['lidar_range_max'])
+    # NaN, inf 값은 최대 lidar range로 대체
+    lidar = np.where(
+        np.isfinite(lidar),
+        lidar,
+        OBS_CONFIG['lidar_range_max'],
+    )
+
     lidar = np.clip(
         lidar,
         OBS_CONFIG['lidar_range_min'],
@@ -93,6 +134,7 @@ def preprocess_obs(
     ).astype(np.float32)
 
 
+# ── Forward Progress Tracker ──────────────────────────────────────────────────
 class ForwardProgressTracker:
     """
     lap_counts를 사용하지 않고 reference waypoint index 변화량으로
@@ -191,10 +233,10 @@ class EvalMetrics:
         self.laps_completed = 0
         self.prev_line_idx = None
 
-        # wp 진행률 표시용
         self.reference_waypoints = reference_waypoints
         self.reference_len = len(reference_waypoints)
         self.total_progress_target = self.reference_len * MAX_LAPS
+
         self.best_progress_score = 1
         self.best_progress_pct = (
             1 / self.total_progress_target * 100.0
@@ -206,14 +248,14 @@ class EvalMetrics:
     def update(
         self,
         obs_raw: dict,
-        speed: float,
+        actual_speed: float,
         line_idx: int,
         waypoints_lines: list,
         progress_score: int,
         progress_pct: float,
         ignored_jump_count: int,
     ):
-        self.speeds.append(abs(float(speed)))
+        self.speeds.append(abs(float(actual_speed)))
         self.laps_completed = int(obs_raw['lap_counts'][0])
 
         x = float(obs_raw['poses_x'][0])
@@ -238,7 +280,7 @@ class EvalMetrics:
         self.prev_line_idx = line_idx
         self.total_steps += 1
 
-    def summary(self, episode: int) -> dict:
+    def summary(self, episode: int, end_reason: str) -> dict:
         avg_speed = float(np.mean(self.speeds)) if self.speeds else 0.0
         avg_deviation = (
             float(np.mean(self.line_deviations))
@@ -249,6 +291,7 @@ class EvalMetrics:
         print(f'\n{"─" * 45}')
         print(f'에피소드 {episode + 1} 결과')
         print(f'{"─" * 45}')
+        print(f'종료 이유     : {end_reason}')
         print(f'완주 lap      : {self.laps_completed}')
         print(f'평균 속도     : {avg_speed:.3f} m/s')
         print(f'평균 라인 오차: {avg_deviation:.4f} m')
@@ -263,6 +306,7 @@ class EvalMetrics:
         print(f'{"─" * 45}\n')
 
         return {
+            'end_reason': end_reason,
             'laps_completed': self.laps_completed,
             'avg_speed': avg_speed,
             'avg_deviation': avg_deviation,
@@ -284,6 +328,7 @@ def load_racing_lines() -> list:
             centerline_path=csv_path,
             num_lines=LINE_CONFIG['num_lines'],
             line_spacing=LINE_CONFIG['line_spacing'],
+            width_fraction=LINE_CONFIG.get('line_width_fraction', 0.60),
         )
     else:
         print('CSV 없음 → 맵 이미지에서 centerline 추출')
@@ -292,6 +337,7 @@ def load_racing_lines() -> list:
             map_ext=LINE_CONFIG['map_ext'],
             num_lines=LINE_CONFIG['num_lines'],
             line_spacing=LINE_CONFIG['line_spacing'],
+            width_fraction=LINE_CONFIG.get('line_width_fraction', 0.60),
         )
 
     print(f'라인 {len(wp["lines"])}개 로드 완료')
@@ -394,10 +440,33 @@ def action_to_env(
         waypoints,
     )
 
-    sac_speed = model.action_to_speed(action, SPEED_MIN, SPEED_MAX)
+    # SAC speed action은 목표 속도로 변환한다.
+    # 목표 속도 자체는 음수로 두지 않고, 실제 감속은 apply_brake에서 처리한다.
+    sac_speed = model.action_to_speed(action, TARGET_SPEED_MIN, SPEED_MAX)
     target_speed = min(sac_speed, pp_speed)
 
-    return steering, target_speed, line_idx
+    cmd_speed = apply_brake(current_speed, target_speed)
+
+    return steering, cmd_speed, line_idx, sac_speed, pp_speed
+
+
+def format_end_reason(
+    end_reason: str,
+    progress_score: int,
+    total_waypoints: int,
+    progress_pct: float,
+    line_idx: int,
+    actual_speed: float,
+    cmd_speed: float,
+) -> str:
+    return (
+        f'[END] reason={end_reason} | '
+        f'wp={progress_score}/{total_waypoints} '
+        f'({progress_pct:.1f}%) | '
+        f'line={line_idx} | '
+        f'actual_speed={actual_speed:.2f} | '
+        f'cmd_speed={cmd_speed:.2f}'
+    )
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
@@ -409,15 +478,13 @@ def main():
     waypoints_lines = load_racing_lines()
     num_lines = MODEL_CONFIG.get('num_lines', LINE_CONFIG['num_lines'])
 
-    # wp 진행률 표시용 기준 라인
-    # SAC가 선택한 line은 바뀔 수 있으므로 가운데 line 기준으로 표시
     progress_reference_line = waypoints_lines[num_lines // 2]
 
     model = load_model(MODEL_SAVE_PATH)
 
     controller = PurePursuitController(
         max_speed=SPEED_MAX,
-        min_speed=SPEED_MIN,
+        min_speed=TARGET_SPEED_MIN,
     )
 
     init_poses = make_init_pose(waypoints_lines)
@@ -437,10 +504,27 @@ def main():
         )
         progress_tracker.reset_from_obs(obs_raw)
 
+        progress_score = 1
+        progress_pct = (
+            1 / progress_tracker.total_waypoints * 100.0
+            if progress_tracker.total_waypoints > 0
+            else 0.0
+        )
+
+        end_reason = 'max_steps'
+
+        last_line_idx = -1
+        last_actual_speed = 0.0
+        last_cmd_speed = 0.0
+
+        progress_window_sum = 0.0
+        progress_window_steps = 0
+        no_progress_bad_count = 0
+
         for _ in range(EVAL_MAX_STEPS):
             action = model.select_action(obs, training=False)
 
-            steering, target_speed, line_idx = action_to_env(
+            steering, cmd_speed, line_idx, sac_speed, pp_speed = action_to_env(
                 action,
                 obs_raw,
                 model,
@@ -448,17 +532,20 @@ def main():
                 controller,
             )
 
-            env_action = np.array([[steering, target_speed]], dtype=np.float32)
+            env_action = np.array([[steering, cmd_speed]], dtype=np.float32)
             next_obs_raw, _, done, _ = env.step(env_action)
             env.render()
 
-            progress_score, progress_pct, forward_done, _ = (
+            current_collision = bool(next_obs_raw['collisions'][0])
+            actual_speed = abs(float(next_obs_raw['linear_vels_x'][0]))
+
+            progress_score, progress_pct, forward_done, progress_delta = (
                 progress_tracker.update(next_obs_raw)
             )
 
             metrics.update(
                 next_obs_raw,
-                target_speed,
+                actual_speed,
                 line_idx,
                 waypoints_lines,
                 progress_score,
@@ -466,49 +553,106 @@ def main():
                 progress_tracker.ignored_jump_count,
             )
 
+            last_line_idx = line_idx
+            last_actual_speed = actual_speed
+            last_cmd_speed = cmd_speed
+
+            # no-progress 검사
+            progress_window_sum += progress_delta
+            progress_window_steps += 1
+
+            no_progress_done = False
+            if progress_window_steps >= NO_PROGRESS_CHECK_INTERVAL:
+                if progress_window_sum < NO_PROGRESS_MIN_DELTA:
+                    no_progress_bad_count += 1
+                else:
+                    no_progress_bad_count = 0
+
+                progress_window_sum = 0.0
+                progress_window_steps = 0
+
+                if no_progress_bad_count >= NO_PROGRESS_PATIENCE:
+                    no_progress_done = True
+
+            # 다음 obs 준비
             obs = preprocess_obs(next_obs_raw, waypoints_lines, num_lines)
             obs_raw = next_obs_raw
 
-            if done or forward_done:
+            # 종료 이유 판정
+            if current_collision:
+                end_reason = 'collision'
                 break
 
-        all_results.append(metrics.summary(episode))
+            if no_progress_done:
+                end_reason = 'no_progress'
+                break
+
+            if forward_done:
+                end_reason = 'forward_done'
+                break
+
+            if done:
+                end_reason = 'env_done'
+                break
+
+        print(
+            format_end_reason(
+                end_reason=end_reason,
+                progress_score=progress_score,
+                total_waypoints=progress_tracker.total_waypoints,
+                progress_pct=progress_pct,
+                line_idx=last_line_idx,
+                actual_speed=last_actual_speed,
+                cmd_speed=last_cmd_speed,
+            )
+        )
+
+        all_results.append(metrics.summary(episode, end_reason))
 
     print(f'\n{"═" * 45}')
     print(f'전체 {EVAL_EPISODES} 에피소드 평균')
     print(f'{"═" * 45}')
-    print(
-        f'평균 완주 lap  : '
-        f'{np.mean([r["laps_completed"] for r in all_results]):.2f}'
-    )
-    print(
-        f'평균 속도      : '
-        f'{np.mean([r["avg_speed"] for r in all_results]):.3f} m/s'
-    )
-    print(
-        f'평균 라인 오차 : '
-        f'{np.mean([r["avg_deviation"] for r in all_results]):.4f} m'
-    )
-    print(
-        f'평균 라인 전환 : '
-        f'{np.mean([r["line_switches"] for r in all_results]):.2f}'
-    )
-    print(
-        f'평균 스텝 수   : '
-        f'{np.mean([r["total_steps"] for r in all_results]):.2f}'
-    )
-    print(
-        f'평균 wp 진행률: '
-        f'{np.mean([r["progress_pct"] for r in all_results]):.1f}%'
-    )
-    print(
-        f'최대 wp 진행률: '
-        f'{np.max([r["progress_pct"] for r in all_results]):.1f}%'
-    )
-    print(
-        f'평균 ignored jump: '
-        f'{np.mean([r["ignored_jump_count"] for r in all_results]):.2f}'
-    )
+
+    if all_results:
+        end_reason_counts = Counter([r['end_reason'] for r in all_results])
+
+        print('종료 이유 분포:')
+        for reason, count in end_reason_counts.items():
+            print(f'  {reason}: {count}')
+
+        print(
+            f'평균 완주 lap  : '
+            f'{np.mean([r["laps_completed"] for r in all_results]):.2f}'
+        )
+        print(
+            f'평균 속도      : '
+            f'{np.mean([r["avg_speed"] for r in all_results]):.3f} m/s'
+        )
+        print(
+            f'평균 라인 오차 : '
+            f'{np.mean([r["avg_deviation"] for r in all_results]):.4f} m'
+        )
+        print(
+            f'평균 라인 전환 : '
+            f'{np.mean([r["line_switches"] for r in all_results]):.2f}'
+        )
+        print(
+            f'평균 스텝 수   : '
+            f'{np.mean([r["total_steps"] for r in all_results]):.2f}'
+        )
+        print(
+            f'평균 wp 진행률: '
+            f'{np.mean([r["progress_pct"] for r in all_results]):.1f}%'
+        )
+        print(
+            f'최대 wp 진행률: '
+            f'{np.max([r["progress_pct"] for r in all_results]):.1f}%'
+        )
+        print(
+            f'평균 ignored jump: '
+            f'{np.mean([r["ignored_jump_count"] for r in all_results]):.2f}'
+        )
+
     print(f'{"═" * 45}\n')
 
     env.close()
