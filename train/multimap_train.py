@@ -103,6 +103,7 @@ def save_trainer(trainer: Trainer, path: str):
                 'action_dim': MODEL_CONFIG['action_dim'],
                 'hidden_dims': MODEL_CONFIG['hidden_dims'],
                 'num_lines': MODEL_CONFIG['num_lines'],
+                'use_line_curvature': OBS_CONFIG.get('use_line_curvature', False),
             },
         },
         path,
@@ -216,18 +217,15 @@ class MapCache:
 
 
 def build_map_baselines(valid_maps: list) -> dict:
-    """
-    맵마다 checkpoint별 warmup baseline을 따로 가진다.
-    """
     baselines = {}
-
+    multiplier = REWARD_CONFIG.get('warmup_baseline_multiplier', 1.5)
     for map_name in valid_maps:
         baselines[map_name] = WarmupCheckpointBaseline(
             num_checkpoints=NUM_CHECKPOINTS,
             fallback_steps=BASELINE_STEPS,
             min_samples=WARMUP_BASELINE_MIN_SAMPLES,
+            multiplier=multiplier,
         )
-
     return baselines
 
 
@@ -613,6 +611,7 @@ def main():
     )
     print(f'  총 목표: 약 {total_target:,} 스텝')
     print(f'  max_laps: {MAX_LAPS}')
+    print(f"  line curvature feature: {OBS_CONFIG.get('use_line_curvature', False)}")
 
     print(f'\n맵 검증 중... (racetracks: {RACETRACKS_DIR})')
 
@@ -635,6 +634,7 @@ def main():
     obs_dim = get_obs_dim(
         OBS_CONFIG['lidar_size'],
         MODEL_CONFIG['num_lines'],
+        use_line_curvature=OBS_CONFIG.get('use_line_curvature', False),
     )
 
     controller = PurePursuitController(

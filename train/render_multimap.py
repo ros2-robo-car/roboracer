@@ -16,8 +16,9 @@ import time
 import argparse
 
 import gym
-import f110_gym
+import f110_gym  # noqa: F401  # gym registry 등록용
 import numpy as np
+import torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -45,6 +46,7 @@ from train_node import (
     action_to_env,
     make_init_pose,
     is_valid_obs,
+    TARGET_SPEED_MIN,
     MAX_LAPS,
     MAX_FORWARD_WP_JUMP,
 )
@@ -103,6 +105,33 @@ def validate_map(map_name: str) -> bool:
     has_yaml = os.path.exists(paths['map_path'] + '.yaml')
 
     return has_csv or (has_img and has_yaml)
+
+
+def load_trainer_checkpoint(trainer: Trainer, model_path: str):
+    """
+    checkpoint를 직접 읽어서 trainer.model에 적용한다.
+    Trainer는 생성 시점의 MODEL_CONFIG와 obs_dim으로 model을 만든다.
+    따라서 config.py의 hidden_dims, num_lines, use_line_curvature 설정은
+    학습 당시 checkpoint와 동일해야 한다.
+    """
+    checkpoint = torch.load(
+        model_path,
+        map_location=trainer.device,
+    )
+
+    if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
+        trainer.model.load_state_dict(checkpoint['model_state'])
+    elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        trainer.model.load_state_dict(checkpoint['state_dict'])
+    elif isinstance(checkpoint, dict):
+        trainer.model.load_state_dict(checkpoint)
+    else:
+        raise RuntimeError(
+            f'지원하지 않는 모델 파일 형식입니다: {type(checkpoint)}'
+        )
+
+    trainer.model.to(trainer.device)
+    trainer.model.eval()
 
 
 def render_one_map(
@@ -216,7 +245,9 @@ def render_one_map(
                     f'wp={progress_score}/{n_waypoints * MAX_LAPS} '
                     f'({progress_pct:.1f}%) | '
                     f'speed={speed:.2f} | '
-                    f'line={line_idx}'
+                    f'line={line_idx} | '
+                    f'action={np.round(action, 3)} | '
+                    f'env_action={np.round(env_action, 3)}'
                 )
                 break
 
@@ -289,20 +320,24 @@ def main():
     obs_dim = get_obs_dim(
         OBS_CONFIG['lidar_size'],
         MODEL_CONFIG['num_lines'],
+        use_line_curvature=OBS_CONFIG.get('use_line_curvature', False),
     )
 
     controller = PurePursuitController(
         max_speed=SPEED_MAX,
-        min_speed=SPEED_MIN,
+        min_speed=TARGET_SPEED_MIN,
     )
 
     trainer = Trainer(obs_dim)
-    trainer.load(model_path)
+    load_trainer_checkpoint(trainer, model_path)
 
     print(f'\n모델 로드 완료: {model_path}')
     print(f'렌더링 맵: {maps}')
-    print(f'SPEED_MIN={SPEED_MIN}, SPEED_MAX={SPEED_MAX}')
+    print(f'SPEED_MIN={SPEED_MIN}, TARGET_SPEED_MIN={TARGET_SPEED_MIN}, SPEED_MAX={SPEED_MAX}')
     print(f'num_lines={MODEL_CONFIG["num_lines"]}')
+    print(f'obs_dim={obs_dim}')
+    print(f'use_line_curvature={OBS_CONFIG.get("use_line_curvature", False)}')
+    print(f'curvature_use_pp_window={OBS_CONFIG.get("curvature_use_pp_window", True)}')
     print(f'line_width_fraction={LINE_CONFIG.get("line_width_fraction", None)}')
 
     for map_name in maps:

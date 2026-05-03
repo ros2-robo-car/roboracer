@@ -11,7 +11,7 @@ import os
 # ══════════════════════════════════════════════════════════════════════════════
 # 맵 설정 (여기만 바꾸면 전체 적용)
 # ══════════════════════════════════════════════════════════════════════════════
-MAP_NAME = 'YasMarina'    # 사용할 맵 이름
+MAP_NAME = 'Austin'    # 사용할 맵 이름
 
 RACETRACKS_DIR = os.path.expanduser('~/f1tenth_racetracks')
 MAP_DIR        = os.path.join(RACETRACKS_DIR, MAP_NAME)
@@ -59,8 +59,19 @@ OBS_CONFIG = {
     'lidar_size'     : 108,
     'lidar_range_min': 0.1,
     'lidar_range_max': 10.0,
-}
 
+    # SAC 입력에 line별 전방 곡률을 추가할지 여부
+    'use_line_curvature'  : True,
+
+    # Pure Pursuit의 속도 감속용 window 설정을 그대로 사용할지 여부
+    'curvature_use_pp_window': True,
+
+    # 각 line의 전방 곡률을 max로 볼지 mean으로 볼지
+    'curvature_mode'      : 'max',
+
+    # 정규화 기준값. curvature / curvature_max_value 후 0~1 clip
+    'curvature_max_value' : 1.5,
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 라인 설정
@@ -88,7 +99,7 @@ LINE_CONFIG = {
 MODEL_CONFIG = {
     'type'       : 'SAC',
     'hidden_dims': [1024, 512, 1024, 1024, 512, 256],
-    'action_dim' : 2,       # [라인 선택, 목표 속도]
+    'action_dim' : 2,       # [라인 선택, pp_speed 배율 조절]
     'num_lines'  : LINE_CONFIG['num_lines'],
 }
 
@@ -105,7 +116,7 @@ TRAIN_CONFIG = {
     'lr_critic'    : 3e-4,
     'lr_alpha'     : 1e-3,
     'max_episodes' : 5000,
-    'max_steps'    : 15000,
+    'max_steps'    : 10000,
     'eval_interval': 5,
     'warmup_steps' : 50000,
 }
@@ -168,11 +179,15 @@ QUANTIZE_EPISODES = 5
 REWARD_CONFIG = {
     'num_checkpoints'     : 10,
     'checkpoint_arrival'  : 5.0,
-    'speed_reward_scale'  : 10.0,
+    'speed_reward_scale'  : 20.0,
+    'sac_speed_scale_range': 0.3,
+    'warmup_speed_action_range': 0.2,
+    
     'baseline_steps': 500,
     'warmup_baseline_min_samples': 3,
+    'warmup_baseline_multiplier': 2.0,
 
-    'collision_penalty_start': -100.0,
+    'collision_penalty_start': -50.0,
     'collision_penalty_end'  : -100.0,
     'collision_curriculum_episodes': 100,
 
@@ -181,12 +196,13 @@ REWARD_CONFIG = {
     'no_progress_check_interval': 100,
     'no_progress_min_delta': 1.0,
     'no_progress_penalty': -0.5,
-    'no_progress_patience': 4,
+    'no_progress_patience': 2,
     'no_progress_terminal_penalty': -100.0,
 
+    'timeout_fixed_penalty': -50.0,
     'timeout_penalty_scale': -100.0,
 
-    'max_laps'            : 2,
+    'max_laps'            : 1,
     'max_forward_wp_jump' : 30,
 
     'steer_speed_threshold': 8.0,
@@ -200,10 +216,10 @@ REWARD_CONFIG = {
 # 멀티맵 학습 설정
 # ══════════════════════════════════════════════════════════════════════════════
 MULTIMAP_CONFIG = {
-    'num_cycles'        : 25,       # 총 사이클 수
+    'num_cycles'        : 23,       # 총 사이클 수
     'warmup_steps'      : 50000,    # 사이클당 warmup 스텝
-    'train_steps'       : 100000,    # 사이클당 학습 스텝
-    'max_steps_per_ep'  : 15000,     # 에피소드당 최대 스텝
+    'train_steps'       : 150000,    # 사이클당 학습 스텝
+    'max_steps_per_ep'  : 10000,     # 에피소드당 최대 스텝
     'eval_episodes'     : 1,        # 평가 시 에피소드 수
 }
  
@@ -233,3 +249,9 @@ MAP_LIST = [
     'YasMarina',
     'Zandvoort',
 ]
+
+QUANTIZE_EPISODES_PER_MAP = 3
+QUANTIZE_START_RATIOS = [0.0, 0.33, 0.66]
+EVAL_MAX_STEPS = 15000
+QUANTIZE_COMPARE_SAMPLES = 3000
+QUANTIZE_TORCH_THREADS = 1
