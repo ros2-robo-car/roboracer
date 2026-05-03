@@ -5,9 +5,9 @@ multimap_train.py
 
 현재 train_node.py 구조에 맞춘 버전:
 - ForwardProgressTracker 사용
-- compute_reward()는 현재 train_node.py 시그니처 사용
-    reward, line_idx, nearest_idx =
-        compute_reward(..., episode=...)
+- compute_reward() 최신 반환값 사용
+    reward, line_idx, nearest_idx, checkpoint_passed, segment_steps, checkpoint_idx
+- 맵별 checkpoint warmup baseline 사용
 - 라인 점프 페널티 제거
 - 충돌 step에는 progress reward를 주지 않음
 - invalid next_obs 발생 시 penalty를 주고 terminal transition 저장
@@ -20,6 +20,7 @@ import sys
 import gym
 import f110_gym
 import numpy as np
+import torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -44,6 +45,7 @@ from pure_pursuit import PurePursuitController
 
 from train_node import (
     CheckpointTracker,
+    WarmupCheckpointBaseline,
     Trainer,
     ForwardProgressTracker,
     preprocess_obs,
@@ -53,7 +55,11 @@ from train_node import (
     make_init_pose,
     is_valid_obs,
     get_collision_penalty,
+    compute_steer_change_penalty,
     NUM_CHECKPOINTS,
+    BASELINE_STEPS,
+    WARMUP_BASELINE_MIN_SAMPLES,
+    TARGET_SPEED_MIN,
     MAX_LAPS,
     MAX_FORWARD_WP_JUMP,
     WAYPOINT_PROGRESS_REWARD,
@@ -78,6 +84,31 @@ def is_valid_transition(obs, action, reward, next_obs) -> bool:
         and np.isfinite(action).all()
         and np.isfinite(reward)
     )
+
+
+def save_trainer(trainer: Trainer, path: str):
+    """
+    train_node.Trainer에 save()가 없는 경우를 대비한 저장 함수.
+    """
+    if hasattr(trainer, 'save') and callable(getattr(trainer, 'save')):
+        trainer.save(path)
+        return
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    torch.save(
+        {
+            'model_state': trainer.model.state_dict(),
+            'model_config': {
+                'action_dim': MODEL_CONFIG['action_dim'],
+                'hidden_dims': MODEL_CONFIG['hidden_dims'],
+                'num_lines': MODEL_CONFIG['num_lines'],
+            },
+        },
+        path,
+    )
+
+    print(f'  모델 저장: {path}')
 
 
 def get_map_paths(map_name: str) -> dict:
@@ -184,10 +215,27 @@ class MapCache:
         return data
 
 
+def build_map_baselines(valid_maps: list) -> dict:
+    """
+    맵마다 checkpoint별 warmup baseline을 따로 가진다.
+    """
+    baselines = {}
+
+    for map_name in valid_maps:
+        baselines[map_name] = WarmupCheckpointBaseline(
+            num_checkpoints=NUM_CHECKPOINTS,
+            fallback_steps=BASELINE_STEPS,
+            min_samples=WARMUP_BASELINE_MIN_SAMPLES,
+        )
+
+    return baselines
+
+
 def run_episode(
     map_data: dict,
     trainer: Trainer,
     controller: PurePursuitController,
+    baseline_provider: WarmupCheckpointBaseline,
     is_warmup: bool,
     max_steps_ep: int,
     episode_for_penalty: int,
@@ -219,6 +267,7 @@ def run_episode(
 
     progress_tracker = None
     tracker = None
+    prev_steering = None
 
     try:
         obs_raw, _, _, _ = env.reset(poses=init_poses)
@@ -304,14 +353,35 @@ def run_episode(
             if np.isfinite(speed_value):
                 speeds.append(speed_value)
 
-            reward, line_idx, _ = compute_reward(
+            (
+                reward,
+                line_idx,
+                _,
+                checkpoint_passed,
+                segment_steps,
+                checkpoint_idx,
+            ) = compute_reward(
                 next_obs_raw,
                 action,
                 trainer.model,
                 waypoints_lines,
                 tracker,
                 episode=episode_for_penalty,
+                baseline_provider=baseline_provider,
             )
+
+            # warmup 중에는 해당 맵의 checkpoint별 baseline sample을 저장
+            if is_warmup and checkpoint_passed:
+                baseline_provider.add(checkpoint_idx, segment_steps)
+
+            current_steering = float(env_action[0])
+            steer_change_penalty = compute_steer_change_penalty(
+                speed_value,
+                current_steering,
+                prev_steering,
+            )
+            reward -= steer_change_penalty
+            prev_steering = current_steering
 
             if not current_collision:
                 reward += WAYPOINT_PROGRESS_REWARD * progress_delta
@@ -358,6 +428,12 @@ def run_episode(
         else 0
     )
 
+    baseline_summary = (
+        baseline_provider.compact_summary()
+        if baseline_provider is not None
+        else '-'
+    )
+
     return {
         'map_name': map_name,
         'reward': episode_reward,
@@ -372,6 +448,7 @@ def run_episode(
         'n_waypoints': n_waypoints,
         'ignored_jump': ignored_jump,
         'crash': collisions,
+        'baseline': baseline_summary,
     }
 
 
@@ -383,20 +460,19 @@ def print_episode(tag: str, ep: int, r: dict, total_steps: int):
         f'{r["map_name"]:16s} | '
         f'reward: {r["reward"]:8.2f} | '
         f'lap: {r["lap_count"]} | '
-        f'cp: {r["cp_passed"]:2d}/{r["cp_total"]} | '
         f'crash: {r["crash"]} | '
         f'speed: {r["avg_speed"]:.2f} | '
         f'line: {r["line_idx"]} | '
         f'steps: {total_steps} | '
         f'wp: {r["progress_score"]}/{n_wp_total} '
         f'({r["progress_pct"]:.1f}%) | '
-        f'ignored_jump: {r["ignored_jump"]}'
     )
 
 
 def run_evaluation(
     eval_maps: list,
     map_cache: MapCache,
+    map_baselines: dict,
     trainer: Trainer,
     controller: PurePursuitController,
     max_steps_ep: int,
@@ -408,12 +484,14 @@ def run_evaluation(
 
     for map_name in eval_maps:
         map_data = map_cache.load(map_name)
+        baseline_provider = map_baselines.get(map_name, None)
 
         for _ in range(n_episodes_per_map):
             env_cfg = make_env_config(map_data['paths'])
             env = gym.make('f110_gym:f110-v0', **env_cfg)
 
             episode_reward = 0.0
+            prev_steering = None
 
             try:
                 obs_raw, _, _, _ = env.reset(poses=map_data['init_poses'])
@@ -455,6 +533,7 @@ def run_evaluation(
                     )
 
                     current_collision = bool(next_obs_raw['collisions'][0])
+                    speed_value = abs(float(next_obs_raw['linear_vels_x'][0]))
 
                     next_obs = preprocess_obs(
                         next_obs_raw,
@@ -476,14 +555,24 @@ def run_evaluation(
                         progress_tracker.update(next_obs_raw)
                     )
 
-                    reward, line_idx, _ = compute_reward(
+                    reward, line_idx, _, _, _, _ = compute_reward(
                         next_obs_raw,
                         action,
                         trainer.model,
                         map_data['waypoints_lines'],
                         eval_tracker,
                         episode=COLLISION_CURRICULUM_EPISODES,
+                        baseline_provider=baseline_provider,
                     )
+
+                    current_steering = float(env_action[0])
+                    steer_change_penalty = compute_steer_change_penalty(
+                        speed_value,
+                        current_steering,
+                        prev_steering,
+                    )
+                    reward -= steer_change_penalty
+                    prev_steering = current_steering
 
                     if not current_collision:
                         reward += WAYPOINT_PROGRESS_REWARD * progress_delta
@@ -524,8 +613,6 @@ def main():
     )
     print(f'  총 목표: 약 {total_target:,} 스텝')
     print(f'  max_laps: {MAX_LAPS}')
-    print(f'  max_forward_wp_jump: {MAX_FORWARD_WP_JUMP}')
-    print(f'  waypoint_progress_reward: {WAYPOINT_PROGRESS_REWARD}')
 
     print(f'\n맵 검증 중... (racetracks: {RACETRACKS_DIR})')
 
@@ -543,6 +630,7 @@ def main():
     print(f'고정 평가 맵: {fixed_eval_maps}\n')
 
     map_cache = MapCache(valid_maps)
+    map_baselines = build_map_baselines(valid_maps)
 
     obs_dim = get_obs_dim(
         OBS_CONFIG['lidar_size'],
@@ -551,7 +639,7 @@ def main():
 
     controller = PurePursuitController(
         max_speed=SPEED_MAX,
-        min_speed=SPEED_MIN,
+        min_speed=TARGET_SPEED_MIN,
     )
 
     trainer = Trainer(obs_dim)
@@ -565,6 +653,10 @@ def main():
 
         cycle_map_name = valid_maps[cycle % len(valid_maps)]
         cycle_map_data = map_cache.load(cycle_map_name)
+        cycle_baseline = map_baselines[cycle_map_name]
+
+        # train_node.Trainer.evaluate()를 쓸 경우를 대비해 현재 맵 baseline을 연결
+        trainer.checkpoint_baselines = cycle_baseline
 
         print(f'\n{"═" * 70}')
         print(
@@ -573,6 +665,7 @@ def main():
             f'총 스텝: {total_steps:,} | '
             f'총 에피소드: {total_episodes}'
         )
+        print(f'baseline: {cycle_baseline.compact_summary()}')
         print(f'{"═" * 70}')
 
         phase_start = total_steps
@@ -589,6 +682,7 @@ def main():
                 map_data=cycle_map_data,
                 trainer=trainer,
                 controller=controller,
+                baseline_provider=cycle_baseline,
                 is_warmup=True,
                 max_steps_ep=max_steps_ep,
                 episode_for_penalty=total_episodes,
@@ -615,6 +709,7 @@ def main():
             f'실제: {total_steps - phase_start:,} 스텝, '
             f'{phase_ep} 에피소드'
         )
+        print(f'Warmup baseline detail | {cycle_baseline.detail_summary()}')
 
         phase_start = total_steps
         phase_target = phase_start + train_steps
@@ -630,6 +725,7 @@ def main():
                 map_data=cycle_map_data,
                 trainer=trainer,
                 controller=controller,
+                baseline_provider=cycle_baseline,
                 is_warmup=False,
                 max_steps_ep=max_steps_ep,
                 episode_for_penalty=total_episodes,
@@ -660,6 +756,7 @@ def main():
         eval_reward_current = run_evaluation(
             eval_maps=[cycle_map_name],
             map_cache=map_cache,
+            map_baselines=map_baselines,
             trainer=trainer,
             controller=controller,
             max_steps_ep=max_steps_ep,
@@ -675,6 +772,7 @@ def main():
         eval_reward_global = run_evaluation(
             eval_maps=fixed_eval_maps,
             map_cache=map_cache,
+            map_baselines=map_baselines,
             trainer=trainer,
             controller=controller,
             max_steps_ep=max_steps_ep,
@@ -689,7 +787,7 @@ def main():
 
         if eval_reward_global >= best_reward:
             best_reward = eval_reward_global
-            trainer.save(MULTIMAP_PATH)
+            save_trainer(trainer, MULTIMAP_PATH)
 
         cycle_steps = total_steps - cycle_start
 
@@ -700,7 +798,7 @@ def main():
             f'누적: {total_steps:,}'
         )
 
-    trainer.save(MULTIMAP_FINAL_PATH)
+    save_trainer(trainer, MULTIMAP_FINAL_PATH)
 
     print(f'\n{"═" * 70}')
     print('전체 학습 완료')
