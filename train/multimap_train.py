@@ -460,12 +460,6 @@ def run_episode(
                     + TIMEOUT_PENALTY_SCALE * (1.0 - progress_pct / 100.0)
                 )
                 reward += timeout_penalty
-                print(
-                    f'[TIMEOUT][{map_name}] terminate | '
-                    f'wp={progress_score}/{n_waypoints * MAX_LAPS} '
-                    f'({progress_pct:.1f}%) | '
-                    f'penalty={timeout_penalty:.1f}'
-                )
 
             terminal = bool(
                 done or forward_done or current_collision or no_progress_done or timeout_done
@@ -733,18 +727,6 @@ def main():
     )
     print(f'  총 목표: 약 {total_target:,} 스텝')
     print(f'  max_laps: {MAX_LAPS}')
-    print(f"  line curvature feature: {OBS_CONFIG.get('use_line_curvature', False)}")
-    print(f'  speed_action_noise_std: {SPEED_ACTION_NOISE_STD}')
-    print(
-        f'  no_progress: interval={NO_PROGRESS_CHECK_INTERVAL}, '
-        f'min_delta={NO_PROGRESS_MIN_DELTA}, '
-        f'patience={NO_PROGRESS_PATIENCE}, '
-        f'terminal_penalty={NO_PROGRESS_TERMINAL_PENALTY}'
-    )
-    print(
-        f'  timeout_penalty: fixed={TIMEOUT_FIXED_PENALTY}, '
-        f'scale={TIMEOUT_PENALTY_SCALE}'
-    )
 
     print(f'\n맵 검증 중... (racetracks: {RACETRACKS_DIR})')
 
