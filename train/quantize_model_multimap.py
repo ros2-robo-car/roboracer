@@ -14,15 +14,17 @@ quantize_model_multimap.py
     cd /home/user/ros2_ws/src/roboracer
     python train/quantize_model_multimap.py
 
-config.py에서 사용할 수 있는 선택 설정:
+config.py 설정:
     QUANTIZED_PATH
-    QUANTIZE_EPISODES_PER_MAP      # 맵마다 각 모델을 몇 번 평가할지
-    QUANTIZE_EPISODES              # EPISODES_PER_MAP 없을 때 fallback
-    QUANTIZE_START_RATIOS          # 예: [0.0, 0.33, 0.66]
-    EVAL_MAX_STEPS
-    QUANTIZE_COMPARE_SAMPLES
-    QUANTIZE_TORCH_THREADS
-    QUANTIZE_MAP_LIST              # 없으면 MAP_LIST 사용
+    QUANTIZE_CONFIG = {
+        'episodes',
+        'episodes_per_map',
+        'start_ratios',
+        'max_steps',
+        'compare_samples',
+        'torch_threads',
+        'map_list',              # 없으면 MAP_LIST 사용
+    }
 """
 
 import copy
@@ -65,7 +67,7 @@ QUANTIZED_PATH = getattr(
     os.path.join(os.path.dirname(MODEL_SAVE_PATH), 'sac_model_actor_int8_dynamic.pth'),
 )
 
-QUANTIZE_CONFIG = getattr(cfg, 'QUANTIZE_CONFIG', {})
+QUANTIZE_CONFIG = cfg.QUANTIZE_CONFIG
 
 EPISODES_PER_MAP = int(
     QUANTIZE_CONFIG.get(
@@ -74,20 +76,11 @@ EPISODES_PER_MAP = int(
     )
 )
 
-EVAL_MAX_STEPS = int(
-    QUANTIZE_CONFIG.get(
-        'max_steps',
-        cfg.TRAIN_CONFIG.get('max_steps', 15000),
-    )
-)
+QUANTIZE_MAX_STEPS = int(QUANTIZE_CONFIG.get('max_steps', 20000))
 
-ACTION_COMPARE_SAMPLES = int(
-    QUANTIZE_CONFIG.get('compare_samples', 3000)
-)
+ACTION_COMPARE_SAMPLES = int(QUANTIZE_CONFIG.get('compare_samples', 3000))
 
-TORCH_THREADS = int(
-    QUANTIZE_CONFIG.get('torch_threads', 1)
-)
+TORCH_THREADS = int(QUANTIZE_CONFIG.get('torch_threads', 1))
 
 START_RATIOS = list(
     QUANTIZE_CONFIG.get('start_ratios', [0.0, 0.33, 0.66])
@@ -99,7 +92,7 @@ if not START_RATIOS:
 MAP_NAMES = list(
     QUANTIZE_CONFIG.get(
         'map_list',
-        getattr(cfg, 'QUANTIZE_MAP_LIST', getattr(cfg, 'MAP_LIST', [])),
+        cfg.MAP_LIST,
     )
 )
 
@@ -262,18 +255,29 @@ def build_model(model_config: dict = None) -> SAC:
     """
     config.py와 checkpoint의 model_config를 기준으로 SAC 모델을 생성한다.
 
-    use_line_curvature=True이면 observation 차원은
-    기존 obs_dim + num_lines가 된다.
+    checkpoint에 obs_dim/use_line_curvature가 저장되어 있으면 그 값을 우선 사용한다.
+    이렇게 해야 곡률 feature를 켠 모델과 끈 모델을 모두 안전하게 불러올 수 있다.
     """
     if model_config is None:
         model_config = cfg.MODEL_CONFIG
 
     num_lines = int(model_config.get('num_lines', cfg.MODEL_CONFIG['num_lines']))
-    obs_dim = get_obs_dim(
-        cfg.OBS_CONFIG['lidar_size'],
-        num_lines,
-        use_line_curvature=cfg.OBS_CONFIG.get('use_line_curvature', False),
-    )
+
+    saved_obs_dim = model_config.get('obs_dim', None)
+    if saved_obs_dim is not None:
+        obs_dim = int(saved_obs_dim)
+    else:
+        use_line_curvature = bool(
+            model_config.get(
+                'use_line_curvature',
+                cfg.OBS_CONFIG.get('use_line_curvature', False),
+            )
+        )
+        obs_dim = get_obs_dim(
+            cfg.OBS_CONFIG['lidar_size'],
+            num_lines,
+            use_line_curvature=use_line_curvature,
+        )
 
     model = SAC(
         obs_dim,
@@ -293,6 +297,11 @@ def load_fp32_model(path: str) -> SAC:
     model_config = dict(cfg.MODEL_CONFIG)
     if isinstance(checkpoint, dict) and 'model_config' in checkpoint:
         model_config.update(checkpoint['model_config'])
+
+    # checkpoint에 곡률 feature 사용 여부가 저장되어 있으면
+    # train_node.preprocess_obs()도 같은 observation 구성을 쓰도록 맞춘다.
+    if 'use_line_curvature' in model_config:
+        cfg.OBS_CONFIG['use_line_curvature'] = bool(model_config['use_line_curvature'])
 
     model = build_model(model_config)
 
@@ -364,7 +373,7 @@ def evaluate_one_episode(
     waypoints_lines = map_data['waypoints_lines']
     reference_line = map_data['reference_line']
     n_waypoints = map_data['n_waypoints']
-    num_lines = cfg.MODEL_CONFIG['num_lines']
+    num_lines = int(getattr(model, 'num_lines', cfg.MODEL_CONFIG['num_lines']))
     timestep = float(env_cfg.get('timestep', cfg.ENV_CONFIG.get('timestep', 0.01)))
 
     init_poses = make_init_pose_from_waypoint(waypoints_lines, start_ratio)
@@ -407,7 +416,7 @@ def evaluate_one_episode(
         deviations = []
         step_count = 0
 
-        for step_in_ep in range(EVAL_MAX_STEPS):
+        for step_in_ep in range(QUANTIZE_MAX_STEPS):
             if collect_obs_samples and len(obs_samples) < ACTION_COMPARE_SAMPLES:
                 obs_samples.append(obs.copy())
 
@@ -465,7 +474,7 @@ def evaluate_one_episode(
             obs = next_obs
             obs_raw = next_obs_raw
 
-            timeout = step_in_ep == EVAL_MAX_STEPS - 1
+            timeout = step_in_ep == QUANTIZE_MAX_STEPS - 1
             if done or forward_done or collision or timeout:
                 break
 
@@ -656,7 +665,7 @@ def main():
     print(f'  maps: {len(valid_maps)}개')
     print(f'  episodes per map per model: {EPISODES_PER_MAP}')
     print(f'  start ratios: {START_RATIOS}')
-    print(f'  max steps: {EVAL_MAX_STEPS}')
+    print(f'  max steps: {QUANTIZE_MAX_STEPS}')
     print(f'  action compare samples max: {ACTION_COMPARE_SAMPLES}')
     print(f'  use_line_curvature: {cfg.OBS_CONFIG.get("use_line_curvature", False)}')
     print(f'  curvature_use_pp_window: {cfg.OBS_CONFIG.get("curvature_use_pp_window", True)}')

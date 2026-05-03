@@ -60,18 +60,24 @@ OBS_CONFIG = {
     'lidar_range_min': 0.1,
     'lidar_range_max': 10.0,
 
-    # SAC 입력에 line별 전방 곡률을 추가할지 여부
-    'use_line_curvature'  : True,
+    # 각 후보 line의 앞쪽 구간 곡률을 SAC observation에 추가할지 여부
+    # True이면 obs_dim이 num_lines만큼 증가한다.
+    'use_line_curvature'        : True,
 
-    # Pure Pursuit의 속도 감속용 window 설정을 그대로 사용할지 여부
-    'curvature_use_pp_window': True,
+    # 현재 위치에서 각 line을 따라 앞쪽 몇 개 waypoint를 볼지
+    'curvature_lookahead_window': 30,
 
-    # 각 line의 전방 곡률을 max로 볼지 mean으로 볼지
-    'curvature_mode'      : 'max',
+    # 곡률 계산 시 waypoint를 몇 칸 간격으로 샘플링할지
+    'curvature_sample_step'     : 2,
 
-    # 정규화 기준값. curvature / curvature_max_value 후 0~1 clip
-    'curvature_max_value' : 1.5,
+    # 'max': 앞쪽 구간 중 가장 급한 커브 사용
+    # 'mean': 앞쪽 구간 평균 곡률 사용
+    'curvature_mode'            : 'max',
+
+    # 곡률 정규화 기준값. curvature / max_value 후 0~1 clip.
+    'curvature_max_value'       : 1.5,
 }
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 라인 설정
@@ -119,6 +125,7 @@ TRAIN_CONFIG = {
     'max_steps'    : 10000,
     'eval_interval': 5,
     'warmup_steps' : 50000,
+    'speed_action_noise_std': 0.02,
 }
 
 
@@ -168,9 +175,12 @@ QUANTIZED_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_quantized.pth'
 # ══════════════════════════════════════════════════════════════════════════════
 # 평가 설정
 # ══════════════════════════════════════════════════════════════════════════════
-EVAL_EPISODES     = 5
-EVAL_MAX_STEPS    = 20000
-QUANTIZE_EPISODES = 5
+EVAL_CONFIG = {
+    'episodes'           : 5,
+    'max_steps'          : 20000,
+    'max_laps'           : 2,
+    'step_debug_interval': 100,
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -207,7 +217,7 @@ REWARD_CONFIG = {
 
     'steer_speed_threshold': 8.0,
     'steer_deadzone': 0.25,
-    'steer_penalty': 0.0,
+    'steer_penalty': 0.05,
 
     'brake_speed_threshold': 7.0,
     'brake_penalty': 0.02,
@@ -250,8 +260,11 @@ MAP_LIST = [
     'Zandvoort',
 ]
 
-QUANTIZE_EPISODES_PER_MAP = 3
-QUANTIZE_START_RATIOS = [0.0, 0.33, 0.66]
-EVAL_MAX_STEPS = 15000
-QUANTIZE_COMPARE_SAMPLES = 3000
-QUANTIZE_TORCH_THREADS = 1
+QUANTIZE_CONFIG = {
+    'episodes'        : 5,
+    'episodes_per_map': 3,
+    'start_ratios'    : [0.0, 0.33, 0.66],
+    'max_steps'       : 20000,
+    'compare_samples' : 3000,
+    'torch_threads'   : 1,
+}
