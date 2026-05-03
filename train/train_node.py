@@ -1,8 +1,7 @@
 """
-train_node_stable.py (Hybrid SAC 안정화 버전)
+train_node_stable_split_entropy.py
 
-SAC가 주행 라인(이산)과 Pure Pursuit 기준 속도 배율(연속)을 선택하고,
-Pure Pursuit가 선택된 라인을 추종하는 구조.
+Hybrid SAC 안정화 버전.
 
 """
 
@@ -783,13 +782,72 @@ class Trainer:
             lr=TRAIN_CONFIG['lr_critic'],
         )
 
+        # 기존 entropy 설계는 그대로 유지한다.
         continuous_entropy = -1.0 * 0.5
         discrete_entropy = -np.log(1.0 / MODEL_CONFIG['num_lines']) * 0.5
-        self.target_entropy = continuous_entropy + discrete_entropy
 
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-        self.alpha = self.log_alpha.exp()
-        self.alpha_opt = optim.Adam([self.log_alpha], lr=TRAIN_CONFIG['lr_alpha'])
+        # 기존 self.target_entropy = continuous_entropy + discrete_entropy 였던 값을
+        # line/speed로 분리해서 사용한다.
+        self.target_entropy_speed = float(continuous_entropy)
+        self.target_entropy_line = float(discrete_entropy)
+        self.target_entropy = self.target_entropy_speed + self.target_entropy_line
+
+        self.log_alpha_line = torch.zeros(1, requires_grad=True, device=self.device)
+        self.log_alpha_speed = torch.zeros(1, requires_grad=True, device=self.device)
+
+        self.alpha_line = self.log_alpha_line.exp()
+        self.alpha_speed = self.log_alpha_speed.exp()
+
+        self.alpha_line_opt = optim.Adam(
+            [self.log_alpha_line],
+            lr=TRAIN_CONFIG['lr_alpha'],
+        )
+        self.alpha_speed_opt = optim.Adam(
+            [self.log_alpha_speed],
+            lr=TRAIN_CONFIG['lr_alpha'],
+        )
+
+    def _unpack_actor_sample(self, sample_output):
+        """
+        actor.sample() 결과에서 line/speed log_prob를 분리한다.
+
+        actor.sample()은 다음 형식이어야 한다.
+            line_idx, speed, total_log_prob, info = actor.sample(obs)
+
+        info에는 반드시 다음 key가 있어야 한다.
+            info['line_log_prob']
+            info['speed_log_prob']
+        """
+        if not isinstance(sample_output, tuple) or len(sample_output) != 4:
+            raise RuntimeError(
+                'actor.sample()은 (line_idx, speed, total_log_prob, info) '
+                '형식으로 4개 값을 반환해야 합니다.'
+            )
+
+        line_idx, speed, total_log_prob, info = sample_output
+
+        if not isinstance(info, dict):
+            raise RuntimeError(
+                'actor.sample()의 4번째 반환값이 dict가 아닙니다. '
+                'sac_model.py에서 line_log_prob와 speed_log_prob를 info dict로 반환하도록 수정해야 합니다.'
+            )
+
+        if 'line_log_prob' not in info or 'speed_log_prob' not in info:
+            raise RuntimeError(
+                'actor.sample() info에 line_log_prob 또는 speed_log_prob가 없습니다.'
+            )
+
+        line_log_prob = info['line_log_prob']
+        speed_log_prob = info['speed_log_prob']
+
+        if line_log_prob.dim() == 1:
+            line_log_prob = line_log_prob.unsqueeze(1)
+        if speed_log_prob.dim() == 1:
+            speed_log_prob = speed_log_prob.unsqueeze(1)
+        if total_log_prob.dim() == 1:
+            total_log_prob = total_log_prob.unsqueeze(1)
+
+        return line_idx, speed, total_log_prob, line_log_prob, speed_log_prob
 
     def update(self):
         if len(self.buffer) < TRAIN_CONFIG['batch_size']:
@@ -813,7 +871,14 @@ class Trainer:
 
         # ── Critic 학습 ──
         with torch.no_grad():
-            next_line_idx, next_speed, next_log_prob, _ = self.model.actor.sample(next_obs)
+            (
+                next_line_idx,
+                next_speed,
+                _,
+                next_line_log_prob,
+                next_speed_log_prob,
+            ) = self._unpack_actor_sample(self.model.actor.sample(next_obs))
+
             next_action_encoded = encode_action(
                 next_line_idx,
                 next_speed,
@@ -822,7 +887,13 @@ class Trainer:
             )
             target_q1 = self.model.target_critic1(next_obs, next_action_encoded)
             target_q2 = self.model.target_critic2(next_obs, next_action_encoded)
-            target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_prob
+
+            next_entropy_term = (
+                self.alpha_line * next_line_log_prob
+                + self.alpha_speed * next_speed_log_prob
+            )
+
+            target_q = torch.min(target_q1, target_q2) - next_entropy_term
             target_q = reward + (1.0 - done) * gamma * target_q
 
         critic1_loss = F.mse_loss(self.model.critic1(obs, buf_action_encoded), target_q)
@@ -838,24 +909,52 @@ class Trainer:
         self.critic2_opt.step()
 
         # ── Actor 학습 ──
-        new_line_idx, new_speed, log_prob, _ = self.model.actor.sample(obs)
+        (
+            new_line_idx,
+            new_speed,
+            _,
+            line_log_prob,
+            speed_log_prob,
+        ) = self._unpack_actor_sample(self.model.actor.sample(obs))
+
         new_action_encoded = encode_action(new_line_idx, new_speed, num_lines, self.device)
         q1_new = self.model.critic1(obs, new_action_encoded)
         q2_new = self.model.critic2(obs, new_action_encoded)
         q_new = torch.min(q1_new, q2_new)
-        actor_loss = (self.alpha * log_prob - q_new).mean()
+
+        # actor update에서는 alpha를 상수처럼 사용한다.
+        entropy_term = (
+            self.alpha_line.detach() * line_log_prob
+            + self.alpha_speed.detach() * speed_log_prob
+        )
+        actor_loss = (entropy_term - q_new).mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.actor.parameters(), GRAD_CLIP_NORM)
         self.actor_opt.step()
 
-        # ── Alpha 학습 ──
-        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
-        self.alpha_opt.zero_grad()
-        alpha_loss.backward()
-        self.alpha_opt.step()
-        self.alpha = self.log_alpha.exp()
+        # ── Alpha 학습: line entropy ──
+        alpha_line_loss = -(
+            self.log_alpha_line
+            * (line_log_prob + self.target_entropy_line).detach()
+        ).mean()
+
+        self.alpha_line_opt.zero_grad()
+        alpha_line_loss.backward()
+        self.alpha_line_opt.step()
+        self.alpha_line = self.log_alpha_line.exp()
+
+        # ── Alpha 학습: speed entropy ──
+        alpha_speed_loss = -(
+            self.log_alpha_speed
+            * (speed_log_prob + self.target_entropy_speed).detach()
+        ).mean()
+
+        self.alpha_speed_opt.zero_grad()
+        alpha_speed_loss.backward()
+        self.alpha_speed_opt.step()
+        self.alpha_speed = self.log_alpha_speed.exp()
 
         # ── Target Critic 소프트 업데이트 ──
         for critic, target_critic in [
@@ -974,6 +1073,8 @@ class Trainer:
         torch.save(
             {
                 'model_state': self.model.state_dict(),
+                'log_alpha_line': self.log_alpha_line.detach().cpu(),
+                'log_alpha_speed': self.log_alpha_speed.detach().cpu(),
                 'model_config': {
                     'action_dim': MODEL_CONFIG['action_dim'],
                     'hidden_dims': MODEL_CONFIG['hidden_dims'],
@@ -994,6 +1095,14 @@ class Trainer:
         checkpoint = torch.load(path, map_location=self.device)
         if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
             self.model.load_state_dict(checkpoint['model_state'])
+
+            if 'log_alpha_line' in checkpoint:
+                self.log_alpha_line.data.copy_(checkpoint['log_alpha_line'].to(self.device))
+                self.alpha_line = self.log_alpha_line.exp()
+
+            if 'log_alpha_speed' in checkpoint:
+                self.log_alpha_speed.data.copy_(checkpoint['log_alpha_speed'].to(self.device))
+                self.alpha_speed = self.log_alpha_speed.exp()
         elif isinstance(checkpoint, dict):
             self.model.load_state_dict(checkpoint)
         else:
@@ -1264,6 +1373,8 @@ def main():
                 torch.save(
                     {
                         'model_state': trainer.model.state_dict(),
+                        'log_alpha_line': trainer.log_alpha_line.detach().cpu(),
+                        'log_alpha_speed': trainer.log_alpha_speed.detach().cpu(),
                         'model_config': {
                             'action_dim': MODEL_CONFIG['action_dim'],
                             'hidden_dims': MODEL_CONFIG['hidden_dims'],

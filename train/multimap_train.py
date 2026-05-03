@@ -3,6 +3,8 @@ multimap_train.py
 
 여러 맵을 순서대로 돌며 학습하는 멀티맵 학습 스크립트
 
+분리 entropy Trainer(alpha_line / alpha_speed)와 호환되도록 저장 로직을 보강한 버전
+
 """
 
 import os
@@ -86,33 +88,52 @@ def is_valid_transition(obs, action, reward, next_obs) -> bool:
     )
 
 
+def build_checkpoint_payload(trainer: Trainer) -> dict:
+    """
+    모델 저장 payload를 만든다.
+
+    split entropy 버전 Trainer는 log_alpha_line / log_alpha_speed를 가진다.
+    예전 Trainer와도 호환되도록 해당 attribute가 있을 때만 저장한다.
+    """
+    payload = {
+        'model_state': trainer.model.state_dict(),
+        'model_config': {
+            'action_dim': MODEL_CONFIG['action_dim'],
+            'hidden_dims': MODEL_CONFIG['hidden_dims'],
+            'num_lines': MODEL_CONFIG['num_lines'],
+            'use_line_curvature': OBS_CONFIG.get('use_line_curvature', False),
+            'obs_dim': get_obs_dim(
+                OBS_CONFIG['lidar_size'],
+                MODEL_CONFIG['num_lines'],
+                use_line_curvature=OBS_CONFIG.get('use_line_curvature', False),
+            ),
+        },
+    }
+
+    # split entropy Trainer용 alpha 상태 저장
+    if hasattr(trainer, 'log_alpha_line'):
+        payload['log_alpha_line'] = trainer.log_alpha_line.detach().cpu()
+    if hasattr(trainer, 'log_alpha_speed'):
+        payload['log_alpha_speed'] = trainer.log_alpha_speed.detach().cpu()
+
+    # 구버전 단일 alpha Trainer와도 호환
+    if hasattr(trainer, 'log_alpha'):
+        payload['log_alpha'] = trainer.log_alpha.detach().cpu()
+
+    return payload
+
+
 def save_trainer(trainer: Trainer, path: str):
     """
-    train_node.Trainer에 save()가 없는 경우를 대비한 저장 함수.
+    train_node.Trainer에 save()가 있으면 그 함수를 우선 사용한다.
+    save()가 없는 Trainer인 경우에도 split entropy alpha 상태를 함께 저장한다.
     """
     if hasattr(trainer, 'save') and callable(getattr(trainer, 'save')):
         trainer.save(path)
         return
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    torch.save(
-        {
-            'model_state': trainer.model.state_dict(),
-            'model_config': {
-                'action_dim': MODEL_CONFIG['action_dim'],
-                'hidden_dims': MODEL_CONFIG['hidden_dims'],
-                'num_lines': MODEL_CONFIG['num_lines'],
-                'use_line_curvature': OBS_CONFIG.get('use_line_curvature', False),
-                'obs_dim': get_obs_dim(
-                    OBS_CONFIG['lidar_size'],
-                    MODEL_CONFIG['num_lines'],
-                    use_line_curvature=OBS_CONFIG.get('use_line_curvature', False),
-                ),
-            },
-        },
-        path,
-    )
+    torch.save(build_checkpoint_payload(trainer), path)
 
     print(f'  모델 저장: {path}')
 
@@ -755,6 +776,14 @@ def main():
     )
 
     trainer = Trainer(obs_dim)
+
+    if hasattr(trainer, 'target_entropy_line') and hasattr(trainer, 'target_entropy_speed'):
+        print(
+            f'  split entropy: '
+            f'line={trainer.target_entropy_line:.3f}, '
+            f'speed={trainer.target_entropy_speed:.3f}, '
+            f'total={trainer.target_entropy:.3f}'
+        )
 
     best_reward = -float('inf')
     total_steps = 0

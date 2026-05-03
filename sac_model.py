@@ -67,35 +67,50 @@ class HybridActor(nn.Module):
     def sample(self, state):
         """
         학습 중 행동 샘플링.
-
+    
         Returns:
             line_idx:       (batch,)           선택된 라인 인덱스
             speed_action:   (batch, 1)         tanh 적용된 속도 배율 action (-1~1)
-            log_prob:       (batch, 1)         전체 log probability
-            line_probs:     (batch, num_lines) 라인 선택 확률
+            total_log_prob: (batch, 1)         전체 log probability
+            info: dict
+                - line_log_prob:  (batch, 1)   라인 선택 log probability
+                - speed_log_prob: (batch, 1)   속도 action log probability
+                - line_probs:     (batch, num_lines) 라인 선택 확률
         """
         line_logits, speed_mean, speed_log_std = self.forward(state)
-
+    
         # ── 이산: 라인 선택 ──
         line_probs = F.softmax(line_logits, dim=-1)
-        line_dist = Categorical(line_probs)
+        line_dist = Categorical(probs=line_probs)
         line_idx = line_dist.sample()
-        line_log_prob = line_dist.log_prob(line_idx)
-
+    
+        # (batch,) → (batch, 1)
+        line_log_prob = line_dist.log_prob(line_idx).unsqueeze(-1)
+    
         # ── 연속: 속도 배율 action ──
         speed_std = speed_log_std.exp()
         speed_dist = Normal(speed_mean, speed_std)
+    
         speed_raw = speed_dist.rsample()
         speed_raw = torch.clamp(speed_raw, -6.0, 6.0)
         speed_action = torch.tanh(speed_raw)
-
+    
         speed_log_prob = speed_dist.log_prob(speed_raw)
         speed_log_prob -= torch.log(1 - speed_action.pow(2) + EPSILON)
-        speed_log_prob = speed_log_prob.sum(dim=-1)
-
-        total_log_prob = (line_log_prob + speed_log_prob).unsqueeze(-1)
-
-        return line_idx, speed_action, total_log_prob, line_probs
+    
+        # (batch, 1) 유지
+        speed_log_prob = speed_log_prob.sum(dim=-1, keepdim=True)
+    
+        # 기존 entropy 로직 유지: 전체 log_prob는 두 log_prob의 합
+        total_log_prob = line_log_prob + speed_log_prob
+    
+        info = {
+            'line_log_prob': line_log_prob,
+            'speed_log_prob': speed_log_prob,
+            'line_probs': line_probs,
+        }
+    
+        return line_idx, speed_action, total_log_prob, info
 
     def get_action(self, state):
         """
