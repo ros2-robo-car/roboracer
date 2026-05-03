@@ -207,7 +207,7 @@ REWARD_CONFIG = {
 
     'steer_speed_threshold': 8.0,
     'steer_deadzone': 0.25,
-    'steer_penalty': 0.05,
+    'steer_penalty': 0.0,
 
     'brake_speed_threshold': 7.0,
     'brake_penalty': 0.02,

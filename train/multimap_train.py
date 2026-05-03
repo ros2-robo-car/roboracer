@@ -3,15 +3,6 @@ multimap_train.py
 
 여러 맵을 순서대로 돌며 학습하는 멀티맵 학습 스크립트
 
-현재 train_node.py 구조에 맞춘 버전:
-- ForwardProgressTracker 사용
-- compute_reward() 최신 반환값 사용
-    reward, line_idx, nearest_idx, checkpoint_passed, segment_steps, checkpoint_idx
-- 맵별 checkpoint warmup baseline 사용
-- 라인 점프 페널티 제거
-- 충돌 step에는 progress reward를 주지 않음
-- invalid next_obs 발생 시 penalty를 주고 terminal transition 저장
-- 평가 시에는 고정 충돌 penalty 사용
 """
 
 import os
@@ -65,6 +56,15 @@ from train_node import (
     WAYPOINT_PROGRESS_REWARD,
     COLLISION_CURRICULUM_EPISODES,
     INVALID_OBS_PENALTY_SCALE,
+    SPEED_ACTION_NOISE_STD,
+    NO_PROGRESS_CHECK_INTERVAL,
+    NO_PROGRESS_MIN_DELTA,
+    NO_PROGRESS_PENALTY,
+    NO_PROGRESS_PATIENCE,
+    NO_PROGRESS_TERMINAL_PENALTY,
+    TIMEOUT_FIXED_PENALTY,
+    TIMEOUT_PENALTY_SCALE,
+    format_lap_times,
 )
 
 
@@ -104,6 +104,11 @@ def save_trainer(trainer: Trainer, path: str):
                 'hidden_dims': MODEL_CONFIG['hidden_dims'],
                 'num_lines': MODEL_CONFIG['num_lines'],
                 'use_line_curvature': OBS_CONFIG.get('use_line_curvature', False),
+                'obs_dim': get_obs_dim(
+                    OBS_CONFIG['lidar_size'],
+                    MODEL_CONFIG['num_lines'],
+                    use_line_curvature=OBS_CONFIG.get('use_line_curvature', False),
+                ),
             },
         },
         path,
@@ -266,6 +271,14 @@ def run_episode(
     progress_tracker = None
     tracker = None
     prev_steering = None
+    no_progress_bad_count = 0
+    progress_window_sum = 0.0
+    progress_window_steps = 0
+    timeout_done = False
+    no_progress_done = False
+    lap_times = []
+    last_lap_step = 0
+    next_lap_progress = n_waypoints
 
     try:
         obs_raw, _, _, _ = env.reset(poses=init_poses)
@@ -280,7 +293,7 @@ def run_episode(
 
         tracker = CheckpointTracker(n_waypoints)
 
-        for _ in range(max_steps_ep):
+        for step_in_ep in range(max_steps_ep):
             if is_warmup:
                 action, env_action = make_warmup_action(
                     obs_raw,
@@ -294,8 +307,9 @@ def run_episode(
                     break
 
                 action = trainer.model.select_action(obs, training=True)
-                speed_noise = np.random.normal(0, 0.05)
-                action[1] = float(np.clip(action[1] + speed_noise, -1.0, 1.0))
+                if SPEED_ACTION_NOISE_STD > 0.0:
+                    speed_noise = np.random.normal(0.0, SPEED_ACTION_NOISE_STD)
+                    action[1] = float(np.clip(action[1] + speed_noise, -1.0, 1.0))
 
                 env_action = action_to_env(
                     action,
@@ -347,6 +361,13 @@ def run_episode(
                 progress_tracker.update(next_obs_raw)
             )
 
+            while progress_score >= next_lap_progress and len(lap_times) < MAX_LAPS:
+                lap_steps = ep_steps + 1 - last_lap_step
+                lap_time = lap_steps * env_cfg.get('timestep', ENV_CONFIG.get('timestep', 0.01))
+                lap_times.append(float(lap_time))
+                last_lap_step = ep_steps + 1
+                next_lap_progress += n_waypoints
+
             speed_value = abs(float(next_obs_raw['linear_vels_x'][0]))
             if np.isfinite(speed_value):
                 speeds.append(speed_value)
@@ -366,6 +387,7 @@ def run_episode(
                 tracker,
                 episode=episode_for_penalty,
                 baseline_provider=baseline_provider,
+                use_speed_reward=not is_warmup,
             )
 
             # warmup 중에는 해당 맵의 checkpoint별 baseline sample을 저장
@@ -381,10 +403,52 @@ def run_episode(
             reward -= steer_change_penalty
             prev_steering = current_steering
 
+            no_progress_done = False
             if not current_collision:
-                reward += WAYPOINT_PROGRESS_REWARD * progress_delta
+                if progress_delta > 0.0:
+                    reward += WAYPOINT_PROGRESS_REWARD * progress_delta
 
-            terminal = bool(done or forward_done or current_collision)
+                progress_window_sum += progress_delta
+                progress_window_steps += 1
+
+                if progress_window_steps >= NO_PROGRESS_CHECK_INTERVAL:
+                    if progress_window_sum < NO_PROGRESS_MIN_DELTA:
+                        reward += NO_PROGRESS_PENALTY
+                        no_progress_bad_count += 1
+                    else:
+                        no_progress_bad_count = 0
+
+                    progress_window_sum = 0.0
+                    progress_window_steps = 0
+
+                if no_progress_bad_count >= NO_PROGRESS_PATIENCE:
+                    reward += NO_PROGRESS_TERMINAL_PENALTY
+                    no_progress_done = True
+                    print(
+                        f'[NO_PROGRESS][{map_name}] terminate | '
+                        f'wp={progress_score}/{n_waypoints * MAX_LAPS} '
+                        f'({progress_pct:.1f}%) | '
+                        f'bad_count={no_progress_bad_count} | '
+                        f'penalty={NO_PROGRESS_TERMINAL_PENALTY}'
+                    )
+
+            timeout_done = step_in_ep == max_steps_ep - 1
+            if timeout_done and not forward_done and not current_collision and not no_progress_done:
+                timeout_penalty = (
+                    TIMEOUT_FIXED_PENALTY
+                    + TIMEOUT_PENALTY_SCALE * (1.0 - progress_pct / 100.0)
+                )
+                reward += timeout_penalty
+                print(
+                    f'[TIMEOUT][{map_name}] terminate | '
+                    f'wp={progress_score}/{n_waypoints * MAX_LAPS} '
+                    f'({progress_pct:.1f}%) | '
+                    f'penalty={timeout_penalty:.1f}'
+                )
+
+            terminal = bool(
+                done or forward_done or current_collision or no_progress_done or timeout_done
+            )
 
             if is_valid_transition(obs, action, reward, next_obs):
                 trainer.buffer.push(
@@ -446,6 +510,9 @@ def run_episode(
         'n_waypoints': n_waypoints,
         'ignored_jump': ignored_jump,
         'crash': collisions,
+        'timeout': int(timeout_done and not forward_done and collisions == 0 and not no_progress_done),
+        'no_prog_bad': no_progress_bad_count,
+        'lap_time': format_lap_times(lap_times),
         'baseline': baseline_summary,
     }
 
@@ -461,6 +528,9 @@ def print_episode(tag: str, ep: int, r: dict, total_steps: int):
         f'crash: {r["crash"]} | '
         f'speed: {r["avg_speed"]:.2f} | '
         f'line: {r["line_idx"]} | '
+        f'no_prog_bad: {r.get("no_prog_bad", 0)} | '
+        f'timeout: {r.get("timeout", 0)} | '
+        f'lap_time: {r.get("lap_time", "-")} | '
         f'steps: {total_steps} | '
         f'wp: {r["progress_score"]}/{n_wp_total} '
         f'({r["progress_pct"]:.1f}%) | '
@@ -490,6 +560,9 @@ def run_evaluation(
 
             episode_reward = 0.0
             prev_steering = None
+            progress_window_sum = 0.0
+            progress_window_steps = 0
+            no_progress_bad_count = 0
 
             try:
                 obs_raw, _, _, _ = env.reset(poses=map_data['init_poses'])
@@ -508,7 +581,7 @@ def run_evaluation(
 
                 eval_tracker = CheckpointTracker(map_data['n_waypoints'])
 
-                for _ in range(max_steps_ep):
+                for step_in_ep in range(max_steps_ep):
                     if not is_valid_obs(obs):
                         print('[WARN][eval] invalid obs before select_action. terminate episode.')
                         break
@@ -549,7 +622,7 @@ def run_evaluation(
                         print('[WARN][eval] invalid next_obs. apply penalty and terminate episode.')
                         break
 
-                    _, _, forward_done, progress_delta = (
+                    progress_score, progress_pct, forward_done, progress_delta = (
                         progress_tracker.update(next_obs_raw)
                     )
 
@@ -561,6 +634,7 @@ def run_evaluation(
                         eval_tracker,
                         episode=COLLISION_CURRICULUM_EPISODES,
                         baseline_provider=baseline_provider,
+                        use_speed_reward=True,
                     )
 
                     current_steering = float(env_action[0])
@@ -572,14 +646,41 @@ def run_evaluation(
                     reward -= steer_change_penalty
                     prev_steering = current_steering
 
+                    no_progress_done = False
                     if not current_collision:
-                        reward += WAYPOINT_PROGRESS_REWARD * progress_delta
+                        if progress_delta > 0.0:
+                            reward += WAYPOINT_PROGRESS_REWARD * progress_delta
+
+                        progress_window_sum += progress_delta
+                        progress_window_steps += 1
+
+                        if progress_window_steps >= NO_PROGRESS_CHECK_INTERVAL:
+                            if progress_window_sum < NO_PROGRESS_MIN_DELTA:
+                                reward += NO_PROGRESS_PENALTY
+                                no_progress_bad_count += 1
+                            else:
+                                no_progress_bad_count = 0
+
+                            progress_window_sum = 0.0
+                            progress_window_steps = 0
+
+                        if no_progress_bad_count >= NO_PROGRESS_PATIENCE:
+                            reward += NO_PROGRESS_TERMINAL_PENALTY
+                            no_progress_done = True
+
+                    timeout_done = step_in_ep == max_steps_ep - 1
+                    if timeout_done and not forward_done and not current_collision and not no_progress_done:
+                        timeout_penalty = (
+                            TIMEOUT_FIXED_PENALTY
+                            + TIMEOUT_PENALTY_SCALE * (1.0 - progress_pct / 100.0)
+                        )
+                        reward += timeout_penalty
 
                     obs = next_obs
                     obs_raw = next_obs_raw
                     episode_reward += float(reward)
 
-                    if done or forward_done or current_collision:
+                    if done or forward_done or current_collision or no_progress_done or timeout_done:
                         break
 
                 total_reward += episode_reward
@@ -612,6 +713,17 @@ def main():
     print(f'  총 목표: 약 {total_target:,} 스텝')
     print(f'  max_laps: {MAX_LAPS}')
     print(f"  line curvature feature: {OBS_CONFIG.get('use_line_curvature', False)}")
+    print(f'  speed_action_noise_std: {SPEED_ACTION_NOISE_STD}')
+    print(
+        f'  no_progress: interval={NO_PROGRESS_CHECK_INTERVAL}, '
+        f'min_delta={NO_PROGRESS_MIN_DELTA}, '
+        f'patience={NO_PROGRESS_PATIENCE}, '
+        f'terminal_penalty={NO_PROGRESS_TERMINAL_PENALTY}'
+    )
+    print(
+        f'  timeout_penalty: fixed={TIMEOUT_FIXED_PENALTY}, '
+        f'scale={TIMEOUT_PENALTY_SCALE}'
+    )
 
     print(f'\n맵 검증 중... (racetracks: {RACETRACKS_DIR})')
 
