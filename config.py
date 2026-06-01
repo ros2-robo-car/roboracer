@@ -11,7 +11,7 @@ import os
 # ══════════════════════════════════════════════════════════════════════════════
 # 맵 설정 (여기만 바꾸면 전체 적용)
 # ══════════════════════════════════════════════════════════════════════════════
-MAP_NAME = 'Austin'    # 사용할 맵 이름
+MAP_NAME = '4floor'    # 사용할 맵 이름
 
 RACETRACKS_DIR = os.path.expanduser('~/f1tenth_racetracks')
 MAP_DIR        = os.path.join(RACETRACKS_DIR, MAP_NAME)
@@ -160,8 +160,8 @@ PURE_PURSUIT_CONFIG = {
 # ══════════════════════════════════════════════════════════════════════════════
 PROJECT_ROOT    = os.path.dirname(os.path.abspath(__file__))
 MODEL_SAVE_PATH = os.path.join(PROJECT_ROOT, 'models', 'sac_model.pth')
-MULTIMAP_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_multimap.pth')
-MULTIMAP_FINAL_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_multimap_final.pth')
+MULTIMAP_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_multimap3.pth')
+MULTIMAP_FINAL_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_multimap_final4.pth')
 QUANTIZED_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_quantized.pth')
 
 
@@ -181,7 +181,7 @@ EVAL_CONFIG = {
 REWARD_CONFIG = {
     'num_checkpoints'     : 10,
     'checkpoint_arrival'  : 5.0,
-    'speed_reward_scale'  : 20.0,
+    'speed_reward_scale'  : 30.0,
     'sac_speed_scale_range': 0.3,
     'warmup_speed_action_range': 0.2,
     
@@ -209,20 +209,25 @@ REWARD_CONFIG = {
 
     'steer_speed_threshold': 8.0,
     'steer_deadzone': 0.25,
-    'steer_penalty': 0.0,
+    'steer_penalty': 0.2,
 
-    'brake_speed_threshold': 7.0,
-    'brake_penalty': 0.02,
+    'line_switch_penalty': 0.005,
+    'straight_curvature_threshold': 0.3,
+    'line_switch_curvature_lookahead': 3,
+    'line_switch_curvature_sample_step': 1,
+
 }
 # ══════════════════════════════════════════════════════════════════════════════
 # 멀티맵 학습 설정
 # ══════════════════════════════════════════════════════════════════════════════
 MULTIMAP_CONFIG = {
-    'num_cycles'        : 23,       # 총 사이클 수
-    'warmup_steps'      : 50000,    # 사이클당 warmup 스텝
-    'train_steps'       : 150000,    # 사이클당 학습 스텝
-    'max_steps_per_ep'  : 10000,     # 에피소드당 최대 스텝
-    'eval_episodes'     : 1,        # 평가 시 에피소드 수
+    'num_cycles'        : 23,
+    'warmup_steps'      : 50000,
+    'train_steps'       : 200000,
+    'train_steps_decay' : 0.5,
+    'train_steps_min'   : 100000,
+    'max_steps_per_ep'  : 10000,
+    'eval_episodes'     : 1,
 }
  
 # f1tenth_racetracks 내 사용할 맵 목록

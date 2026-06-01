@@ -1,7 +1,7 @@
 """
-train_node_stable_split_entropy.py
+train_node_line_stable.py
 
-Hybrid SAC 안정화 버전.
+Hybrid SAC 안정화 버전 + 직진 라인 전환 패널티.
 
 """
 
@@ -40,19 +40,12 @@ from pure_pursuit import PurePursuitController
 # ── 브레이크 설정 ─────────────────────────────────────────────────────────────
 BRAKE_GAIN = REWARD_CONFIG.get('brake_gain', 0.5)
 
-# SPEED_MIN은 환경에 넣는 command speed의 하한값으로 사용한다.
-# SAC/Pure Pursuit가 선택하는 목표 속도의 하한은 TARGET_SPEED_MIN으로 분리한다.
 TARGET_SPEED_MIN = REWARD_CONFIG.get('target_speed_min', 0.5)
 
-# action[1]을 pp_speed 기준 배율로 해석할 때의 범위.
-# 예: 0.2이면 action[1] = -1 → 0.8배, 0 → 1.0배, +1 → 1.2배
 SAC_SPEED_SCALE_RANGE = REWARD_CONFIG.get('sac_speed_scale_range', 0.2)
 
-# warmup buffer에 넣는 speed scale action의 랜덤 범위.
-# 예: 0.2이면 warmup action[1]은 [-0.2, 0.2]에서 샘플링.
 WARMUP_SPEED_ACTION_RANGE = REWARD_CONFIG.get('warmup_speed_action_range', 0.2)
 
-# 학습 중 탐색 noise. 기존 0.05보다 보수적으로 0.02 권장.
 SPEED_ACTION_NOISE_STD = TRAIN_CONFIG.get(
     'speed_action_noise_std',
     REWARD_CONFIG.get('speed_action_noise_std', 0.02),
@@ -106,6 +99,15 @@ INVALID_OBS_PENALTY_SCALE = REWARD_CONFIG.get('invalid_obs_penalty_scale', 2.0)
 GRAD_CLIP_NORM = TRAIN_CONFIG.get('grad_clip_norm', 1.0)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  직진 라인 전환 패널티 설정
+# ══════════════════════════════════════════════════════════════════════════════
+LINE_SWITCH_PENALTY = REWARD_CONFIG.get('line_switch_penalty', 0.1)
+STRAIGHT_CURVATURE_THRESHOLD = REWARD_CONFIG.get('straight_curvature_threshold', 0.3)
+LINE_SWITCH_CURVATURE_LOOKAHEAD = REWARD_CONFIG.get('line_switch_curvature_lookahead', 3)
+LINE_SWITCH_CURVATURE_SAMPLE_STEP = REWARD_CONFIG.get('line_switch_curvature_sample_step', 1)
+
+
 def get_collision_penalty(episode: int) -> float:
     """에피소드에 따라 충돌 페널티를 점진적으로 키운다."""
     if episode >= COLLISION_CURRICULUM_EPISODES:
@@ -145,10 +147,6 @@ class CheckpointTracker:
         self.segment_steps += 1
 
     def check(self, nearest_idx: int) -> tuple:
-        """
-        Returns:
-            passed, segment_steps, is_last_checkpoint, passed_checkpoint_idx
-        """
         if self.next_checkpoint >= len(self.checkpoint_indices):
             return False, 0, False, -1
 
@@ -191,14 +189,11 @@ class WarmupCheckpointBaseline:
     def add(self, checkpoint_idx: int, segment_steps: int):
         if checkpoint_idx is None:
             return
-
         checkpoint_idx = int(checkpoint_idx)
         if checkpoint_idx < 0 or checkpoint_idx >= self.num_checkpoints:
             return
-
         if segment_steps is None or segment_steps <= 0:
             return
-
         self.samples[checkpoint_idx].append(float(segment_steps))
 
     def ready(self, checkpoint_idx: int) -> bool:
@@ -277,10 +272,6 @@ class ForwardProgressTracker:
         self.ignored_jump_count = 0
 
     def update(self, obs_raw: dict) -> tuple:
-        """
-        Returns:
-            progress_score, progress_pct, forward_done, progress_delta
-        """
         x = float(obs_raw['poses_x'][0])
         y = float(obs_raw['poses_y'][0])
         position = np.array([x, y], dtype=np.float32)
@@ -319,7 +310,6 @@ class ForwardProgressTracker:
 
 # ── 브레이크 유틸리티 ─────────────────────────────────────────────────────────
 def apply_brake(current_speed: float, target_speed: float) -> float:
-    """현재 속도가 목표속도보다 높으면 command speed를 낮춰 감속한다."""
     if current_speed > target_speed:
         diff = current_speed - target_speed
         cmd_speed = target_speed - BRAKE_GAIN * diff
@@ -345,7 +335,144 @@ def compute_steer_change_penalty(
     return float(STEER_PENALTY * steer_over * speed_over)
 
 
-# ── 웨이포인트 로드 ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  직진 라인 전환 패널티용 곡률 계산 함수
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_three_point_curvature(
+    p0: np.ndarray,
+    p1: np.ndarray,
+    p2: np.ndarray,
+) -> float:
+    """세 waypoint 점을 이용해 곡률을 계산한다."""
+    a = float(np.linalg.norm(p1 - p0))
+    b = float(np.linalg.norm(p2 - p1))
+    c = float(np.linalg.norm(p2 - p0))
+
+    denom = a * b * c
+    if denom < 1e-6:
+        return 0.0
+
+    v1 = p1 - p0
+    v2 = p2 - p0
+    cross = abs(float(v1[0] * v2[1] - v1[1] * v2[0]))
+    curvature = 2.0 * cross / denom
+
+    if not np.isfinite(curvature):
+        return 0.0
+
+    return float(curvature)
+
+
+def _get_local_curvature(
+    obs_raw: dict,
+    waypoints: np.ndarray,
+    lookahead: int = None,
+    sample_step: int = None,
+) -> float:
+    """
+    현재 위치 부근 waypoint의 전방 최대 곡률을 계산한다.
+    직진 라인 전환 패널티 판정에 사용한다.
+    """
+    if lookahead is None:
+        lookahead = LINE_SWITCH_CURVATURE_LOOKAHEAD
+    if sample_step is None:
+        sample_step = LINE_SWITCH_CURVATURE_SAMPLE_STEP
+
+    x = float(obs_raw['poses_x'][0])
+    y = float(obs_raw['poses_y'][0])
+    position = np.array([x, y], dtype=np.float32)
+
+    n = len(waypoints)
+    nearest_idx = get_nearest_waypoint_idx(position, waypoints)
+
+    curvatures = []
+    for offset in range(0, lookahead, sample_step):
+        i0 = (nearest_idx + offset) % n
+        i1 = (nearest_idx + offset + sample_step) % n
+        i2 = (nearest_idx + offset + 2 * sample_step) % n
+        curvatures.append(
+            compute_three_point_curvature(waypoints[i0], waypoints[i1], waypoints[i2])
+        )
+
+    return float(np.max(curvatures)) if curvatures else 0.0
+
+
+def compute_line_switch_penalty(
+    curvature: float,
+    line_changed: bool,
+) -> float:
+    """
+    직진 구간에서 라인을 변경하면 패널티를 부여한다.
+    곡률이 threshold 미만(직진)이면 graduated 패널티, 이상(커브)이면 0.
+    """
+    if not line_changed:
+        return 0.0
+
+    if curvature >= STRAIGHT_CURVATURE_THRESHOLD:
+        return 0.0
+
+    ratio = 1.0 - (curvature / STRAIGHT_CURVATURE_THRESHOLD)
+    return LINE_SWITCH_PENALTY * ratio
+
+
+# ── 웨이포인트 / observation 관련 (기존 그대로) ───────────────────────────────
+def compute_line_lookahead_curvatures(
+    obs_raw: dict,
+    waypoints_lines: list,
+    mode: str = 'max',
+    normalize: bool = True,
+    max_curvature: float = 1.5,
+) -> np.ndarray:
+    x = float(obs_raw['poses_x'][0])
+    y = float(obs_raw['poses_y'][0])
+    current_speed = abs(float(obs_raw['linear_vels_x'][0]))
+
+    position = np.array([x, y], dtype=np.float32)
+
+    if OBS_CONFIG.get('curvature_use_pp_window', True):
+        lookahead_window = int(
+            PURE_PURSUIT_CONFIG.get('lookahead_window_base', 5)
+            + current_speed * PURE_PURSUIT_CONFIG.get('lookahead_window_speed_scale', 2)
+        )
+        sample_step = int(PURE_PURSUIT_CONFIG.get('curvature_sample_step', 2))
+    else:
+        lookahead_window = int(OBS_CONFIG.get('curvature_lookahead_window', 30))
+        sample_step = int(OBS_CONFIG.get('curvature_sample_step', 2))
+
+    lookahead_window = max(lookahead_window, 3)
+    sample_step = max(sample_step, 1)
+
+    line_curvatures = []
+
+    for waypoints in waypoints_lines:
+        n = len(waypoints)
+        nearest_idx = get_nearest_waypoint_idx(position, waypoints)
+
+        curvatures = []
+        for offset in range(0, lookahead_window, sample_step):
+            i0 = (nearest_idx + offset) % n
+            i1 = (nearest_idx + offset + sample_step) % n
+            i2 = (nearest_idx + offset + 2 * sample_step) % n
+            curvature = compute_three_point_curvature(
+                waypoints[i0], waypoints[i1], waypoints[i2],
+            )
+            curvatures.append(curvature)
+
+        if not curvatures:
+            line_curvature = 0.0
+        elif mode == 'mean':
+            line_curvature = float(np.mean(curvatures))
+        else:
+            line_curvature = float(np.max(curvatures))
+
+        if normalize:
+            line_curvature = np.clip(line_curvature / max_curvature, 0.0, 1.0)
+
+        line_curvatures.append(line_curvature)
+
+    return np.array(line_curvatures, dtype=np.float32)
+
+
 def load_racing_lines() -> dict:
     csv_path = LINE_CONFIG['centerline_csv']
 
@@ -426,103 +553,6 @@ def preprocess_lidar(obs_raw: dict) -> np.ndarray:
     return lidar.astype(np.float32)
 
 
-def compute_three_point_curvature(
-    p0: np.ndarray,
-    p1: np.ndarray,
-    p2: np.ndarray,
-) -> float:
-    """
-    세 waypoint 점을 이용해 곡률을 계산한다.
-
-    곡률이 클수록 해당 구간이 급하게 휘는 것으로 해석한다.
-    거의 직선이면 0에 가까운 값이 나온다.
-    """
-    a = float(np.linalg.norm(p1 - p0))
-    b = float(np.linalg.norm(p2 - p1))
-    c = float(np.linalg.norm(p2 - p0))
-
-    denom = a * b * c
-    if denom < 1e-6:
-        return 0.0
-
-    v1 = p1 - p0
-    v2 = p2 - p0
-
-    # 2D cross product 크기. 삼각형 넓이 기반 곡률 계산에 사용한다.
-    cross = abs(float(v1[0] * v2[1] - v1[1] * v2[0]))
-    curvature = 2.0 * cross / denom
-
-    if not np.isfinite(curvature):
-        return 0.0
-
-    return float(curvature)
-
-
-def compute_line_lookahead_curvatures(
-    obs_raw: dict,
-    waypoints_lines: list,
-    mode: str = 'max',
-    normalize: bool = True,
-    max_curvature: float = 1.5,
-) -> np.ndarray:
-    x = float(obs_raw['poses_x'][0])
-    y = float(obs_raw['poses_y'][0])
-    current_speed = abs(float(obs_raw['linear_vels_x'][0]))
-
-    position = np.array([x, y], dtype=np.float32)
-
-    if OBS_CONFIG.get('curvature_use_pp_window', True):
-        lookahead_window = int(
-            PURE_PURSUIT_CONFIG.get('lookahead_window_base', 5)
-            + current_speed * PURE_PURSUIT_CONFIG.get('lookahead_window_speed_scale', 2)
-        )
-        sample_step = int(PURE_PURSUIT_CONFIG.get('curvature_sample_step', 2))
-    else:
-        lookahead_window = int(OBS_CONFIG.get('curvature_lookahead_window', 30))
-        sample_step = int(OBS_CONFIG.get('curvature_sample_step', 2))
-
-    lookahead_window = max(lookahead_window, 3)
-    sample_step = max(sample_step, 1)
-
-    line_curvatures = []
-
-    for waypoints in waypoints_lines:
-        n = len(waypoints)
-        nearest_idx = get_nearest_waypoint_idx(position, waypoints)
-
-        curvatures = []
-
-        for offset in range(0, lookahead_window, sample_step):
-            i0 = (nearest_idx + offset) % n
-            i1 = (nearest_idx + offset + sample_step) % n
-            i2 = (nearest_idx + offset + 2 * sample_step) % n
-
-            p0 = waypoints[i0]
-            p1 = waypoints[i1]
-            p2 = waypoints[i2]
-
-            curvature = compute_three_point_curvature(p0, p1, p2)
-            curvatures.append(curvature)
-
-        if not curvatures:
-            line_curvature = 0.0
-        elif mode == 'mean':
-            line_curvature = float(np.mean(curvatures))
-        else:
-            line_curvature = float(np.max(curvatures))
-
-        if normalize:
-            line_curvature = np.clip(
-                line_curvature / max_curvature,
-                0.0,
-                1.0,
-            )
-
-        line_curvatures.append(line_curvature)
-
-    return np.array(line_curvatures, dtype=np.float32)
-
-
 def preprocess_obs(obs_raw: dict, waypoints_lines: list, num_lines: int) -> np.ndarray:
     lidar = preprocess_lidar(obs_raw)
     position = np.array(
@@ -533,23 +563,16 @@ def preprocess_obs(obs_raw: dict, waypoints_lines: list, num_lines: int) -> np.n
     speed = float(obs_raw['linear_vels_x'][0])
 
     base_obs = build_observation(
-        lidar,
-        position,
-        heading,
-        speed,
-        waypoints_lines,
-        num_lines,
+        lidar, position, heading, speed, waypoints_lines, num_lines,
     ).astype(np.float32)
 
     if OBS_CONFIG.get('use_line_curvature', False):
         line_curvatures = compute_line_lookahead_curvatures(
-            obs_raw,
-            waypoints_lines,
+            obs_raw, waypoints_lines,
             mode=OBS_CONFIG.get('curvature_mode', 'max'),
             normalize=True,
             max_curvature=OBS_CONFIG.get('curvature_max_value', 1.5),
         )
-
         return np.concatenate([base_obs, line_curvatures]).astype(np.float32)
 
     return base_obs.astype(np.float32)
@@ -563,17 +586,6 @@ def action_to_env(
     waypoints_lines: list,
     controller: PurePursuitController,
 ) -> np.ndarray:
-    """
-    action[1]을 절대 속도가 아니라 pp_speed 기준 배율로 해석한다.
-
-    speed_scale = 1 + SAC_SPEED_SCALE_RANGE * action[1]
-
-    예:
-        SAC_SPEED_SCALE_RANGE = 0.2
-        action[1] = -1.0 → pp_speed * 0.8
-        action[1] =  0.0 → pp_speed * 1.0
-        action[1] = +1.0 → pp_speed * 1.2
-    """
     line_idx = model.action_to_line_index(action)
     waypoints = waypoints_lines[line_idx]
 
@@ -604,13 +616,6 @@ def compute_reward(
     baseline_provider: WarmupCheckpointBaseline = None,
     use_speed_reward: bool = True,
 ):
-    """
-    Returns:
-        reward, line_idx, nearest_idx, checkpoint_passed, segment_steps, checkpoint_idx
-
-    use_speed_reward=False이면 checkpoint 도착 보상만 주고,
-    baseline 대비 speed reward는 주지 않는다. warmup 중에는 False 권장.
-    """
     x = float(obs_raw['poses_x'][0])
     y = float(obs_raw['poses_y'][0])
     collision = bool(obs_raw['collisions'][0])
@@ -639,29 +644,19 @@ def compute_reward(
                 current_baseline_steps = BASELINE_STEPS
 
             current_baseline_steps = max(float(current_baseline_steps), 1.0)
-
             time_ratio = max(0.0, 1.0 - segment_steps / current_baseline_steps)
             checkpoint_reward += SPEED_REWARD_SCALE * time_ratio
 
     return checkpoint_reward, line_idx, nearest_idx, passed, segment_steps, checkpoint_idx
 
 
-# ── Warmup (Pure Pursuit 기반) ────────────────────────────────────────────────
+# ── Warmup ────────────────────────────────────────────────────────────────────
 def make_warmup_action(
     obs_raw: dict,
     waypoints_lines: list,
     num_lines: int,
     controller: PurePursuitController,
 ) -> tuple:
-    """
-    Hybrid SAC용 warmup action 생성.
-
-    새 speed action 의미:
-        action[1] = 0.0 → pp_speed 그대로
-
-    안정성을 위해 warmup에서는 [-WARMUP_SPEED_ACTION_RANGE, +WARMUP_SPEED_ACTION_RANGE]
-    안에서 작은 랜덤 speed action을 넣고, 실제 env_action도 같은 배율을 반영한다.
-    """
     x = float(obs_raw['poses_x'][0])
     y = float(obs_raw['poses_y'][0])
     heading = float(obs_raw['poses_theta'][0])
@@ -735,7 +730,6 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=max_size)
 
     def push(self, obs, action, reward, next_obs, done):
-        """action: [line_idx(정수), speed_val(-1~1)]"""
         self.buffer.append((obs, action, reward, next_obs, done))
 
     def sample(self, batch_size: int):
@@ -782,12 +776,10 @@ class Trainer:
             lr=TRAIN_CONFIG['lr_critic'],
         )
 
-        # 기존 entropy 설계는 그대로 유지한다.
-        continuous_entropy = -1.0 * 0.5
-        discrete_entropy = -np.log(1.0 / MODEL_CONFIG['num_lines']) * 0.5
+        continuous_entropy = -1.0 * 0.2
 
-        # 기존 self.target_entropy = continuous_entropy + discrete_entropy 였던 값을
-        # line/speed로 분리해서 사용한다.
+        discrete_entropy = -np.log(1.0 / MODEL_CONFIG['num_lines']) * 0.0
+
         self.target_entropy_speed = float(continuous_entropy)
         self.target_entropy_line = float(discrete_entropy)
         self.target_entropy = self.target_entropy_speed + self.target_entropy_line
@@ -808,16 +800,6 @@ class Trainer:
         )
 
     def _unpack_actor_sample(self, sample_output):
-        """
-        actor.sample() 결과에서 line/speed log_prob를 분리한다.
-
-        actor.sample()은 다음 형식이어야 한다.
-            line_idx, speed, total_log_prob, info = actor.sample(obs)
-
-        info에는 반드시 다음 key가 있어야 한다.
-            info['line_log_prob']
-            info['speed_log_prob']
-        """
         if not isinstance(sample_output, tuple) or len(sample_output) != 4:
             raise RuntimeError(
                 'actor.sample()은 (line_idx, speed, total_log_prob, info) '
@@ -828,8 +810,7 @@ class Trainer:
 
         if not isinstance(info, dict):
             raise RuntimeError(
-                'actor.sample()의 4번째 반환값이 dict가 아닙니다. '
-                'sac_model.py에서 line_log_prob와 speed_log_prob를 info dict로 반환하도록 수정해야 합니다.'
+                'actor.sample()의 4번째 반환값이 dict가 아닙니다.'
             )
 
         if 'line_log_prob' not in info or 'speed_log_prob' not in info:
@@ -872,18 +853,12 @@ class Trainer:
         # ── Critic 학습 ──
         with torch.no_grad():
             (
-                next_line_idx,
-                next_speed,
-                _,
-                next_line_log_prob,
-                next_speed_log_prob,
+                next_line_idx, next_speed, _,
+                next_line_log_prob, next_speed_log_prob,
             ) = self._unpack_actor_sample(self.model.actor.sample(next_obs))
 
             next_action_encoded = encode_action(
-                next_line_idx,
-                next_speed,
-                num_lines,
-                self.device,
+                next_line_idx, next_speed, num_lines, self.device,
             )
             target_q1 = self.model.target_critic1(next_obs, next_action_encoded)
             target_q2 = self.model.target_critic2(next_obs, next_action_encoded)
@@ -910,11 +885,8 @@ class Trainer:
 
         # ── Actor 학습 ──
         (
-            new_line_idx,
-            new_speed,
-            _,
-            line_log_prob,
-            speed_log_prob,
+            new_line_idx, new_speed, _,
+            line_log_prob, speed_log_prob,
         ) = self._unpack_actor_sample(self.model.actor.sample(obs))
 
         new_action_encoded = encode_action(new_line_idx, new_speed, num_lines, self.device)
@@ -922,7 +894,6 @@ class Trainer:
         q2_new = self.model.critic2(obs, new_action_encoded)
         q_new = torch.min(q1_new, q2_new)
 
-        # actor update에서는 alpha를 상수처럼 사용한다.
         entropy_term = (
             self.alpha_line.detach() * line_log_prob
             + self.alpha_speed.detach() * speed_log_prob
@@ -965,12 +936,7 @@ class Trainer:
                 target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
     def evaluate(
-        self,
-        env,
-        waypoints_lines: list,
-        controller: PurePursuitController,
-        init_poses: np.ndarray,
-        n_episodes: int = 3,
+        self, env, waypoints_lines, controller, init_poses, n_episodes=3,
     ) -> float:
         total_reward = 0.0
         num_lines = MODEL_CONFIG['num_lines']
@@ -982,9 +948,7 @@ class Trainer:
             obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
 
             progress_tracker = ForwardProgressTracker(
-                reference_line,
-                max_laps=MAX_LAPS,
-                max_forward_jump=MAX_FORWARD_WP_JUMP,
+                reference_line, max_laps=MAX_LAPS, max_forward_jump=MAX_FORWARD_WP_JUMP,
             )
             progress_tracker.reset_from_obs(obs_raw)
             eval_checkpoint = CheckpointTracker(n_wp)
@@ -996,7 +960,6 @@ class Trainer:
 
             for step_in_ep in range(TRAIN_CONFIG['max_steps']):
                 if not is_valid_obs(obs):
-                    print('[WARN][eval] invalid obs before select_action. terminate episode.')
                     break
 
                 action = self.model.select_action(obs, training=False)
@@ -1010,19 +973,13 @@ class Trainer:
                 if not is_valid_obs(next_obs):
                     invalid_penalty = get_collision_penalty(COLLISION_CURRICULUM_EPISODES) * INVALID_OBS_PENALTY_SCALE
                     total_reward += float(invalid_penalty)
-                    print('[WARN][eval] invalid next_obs. apply penalty and terminate episode.')
                     break
 
                 progress_score, progress_pct, forward_done, progress_delta = progress_tracker.update(next_obs_raw)
                 reward, _, _, _, _, _ = compute_reward(
-                    next_obs_raw,
-                    action,
-                    self.model,
-                    waypoints_lines,
-                    eval_checkpoint,
-                    episode=COLLISION_CURRICULUM_EPISODES,
-                    baseline_provider=self.checkpoint_baselines,
-                    use_speed_reward=True,
+                    next_obs_raw, action, self.model, waypoints_lines,
+                    eval_checkpoint, episode=COLLISION_CURRICULUM_EPISODES,
+                    baseline_provider=self.checkpoint_baselines, use_speed_reward=True,
                 )
 
                 current_steering = float(env_action[0])
@@ -1043,7 +1000,6 @@ class Trainer:
                             no_progress_bad_count += 1
                         else:
                             no_progress_bad_count = 0
-
                         progress_window_sum = 0.0
                         progress_window_steps = 0
 
@@ -1095,11 +1051,9 @@ class Trainer:
         checkpoint = torch.load(path, map_location=self.device)
         if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
             self.model.load_state_dict(checkpoint['model_state'])
-
             if 'log_alpha_line' in checkpoint:
                 self.log_alpha_line.data.copy_(checkpoint['log_alpha_line'].to(self.device))
                 self.alpha_line = self.log_alpha_line.exp()
-
             if 'log_alpha_speed' in checkpoint:
                 self.log_alpha_speed.data.copy_(checkpoint['log_alpha_speed'].to(self.device))
                 self.alpha_speed = self.log_alpha_speed.exp()
@@ -1155,8 +1109,6 @@ def main():
     print(f'브레이크 gain: {BRAKE_GAIN}')
 
     for episode in range(TRAIN_CONFIG['max_episodes']):
-        # episode 시작 시점에 warmup 여부를 고정한다.
-        # episode 중간에서 warmup_steps를 넘더라도 그 episode는 warmup으로 끝낸다.
         is_warmup_episode = total_steps < TRAIN_CONFIG['warmup_steps']
 
         obs_raw, _, _, _ = env.reset(poses=init_poses)
@@ -1187,13 +1139,14 @@ def main():
         no_progress_done_count = 0
         prev_steering = None
 
+        prev_line_idx = None
+        ep_line_switches = 0
+        ep_straight_switches = 0
+
         for step_in_ep in range(TRAIN_CONFIG['max_steps']):
             if is_warmup_episode:
                 action, env_action = make_warmup_action(
-                    obs_raw,
-                    waypoints_lines,
-                    num_lines,
-                    controller,
+                    obs_raw, waypoints_lines, num_lines, controller,
                 )
             else:
                 if not is_valid_obs(obs):
@@ -1206,11 +1159,7 @@ def main():
                     action[1] = float(np.clip(action[1] + speed_noise, -1.0, 1.0))
 
                 env_action = action_to_env(
-                    action,
-                    obs_raw,
-                    trainer.model,
-                    waypoints_lines,
-                    controller,
+                    action, obs_raw, trainer.model, waypoints_lines, controller,
                 )
 
             next_obs_raw, _, done, _ = env.step(np.array([env_action]))
@@ -1244,24 +1193,37 @@ def main():
                 speeds.append(speed_value)
 
             reward, line_idx, _, checkpoint_passed, segment_steps, checkpoint_idx = compute_reward(
-                next_obs_raw,
-                action,
-                trainer.model,
-                waypoints_lines,
-                checkpoint_tracker,
-                episode=episode,
+                next_obs_raw, action, trainer.model, waypoints_lines,
+                checkpoint_tracker, episode=episode,
                 baseline_provider=warmup_baseline,
                 use_speed_reward=not is_warmup_episode,
             )
             last_line_idx = line_idx
 
-            # warmup 중에는 speed reward 없이 baseline sample만 저장한다.
             if is_warmup_episode and checkpoint_passed:
                 warmup_baseline.add(checkpoint_idx, segment_steps)
 
             current_steering = float(env_action[0])
             reward -= compute_steer_change_penalty(speed_value, current_steering, prev_steering)
             prev_steering = current_steering
+
+            line_changed = (
+                prev_line_idx is not None
+                and line_idx != prev_line_idx
+            )
+
+            if line_changed:
+                ep_line_switches += 1
+                curvature = _get_local_curvature(
+                    next_obs_raw, waypoints_lines[line_idx],
+                )
+                switch_penalty = compute_line_switch_penalty(curvature, line_changed)
+                if switch_penalty > 0:
+                    reward -= switch_penalty
+                    ep_straight_switches += 1
+
+            prev_line_idx = line_idx
+            # ══════════════════════════════════════════════════════════════
 
             if current_collision:
                 print(
@@ -1328,8 +1290,6 @@ def main():
             episode_reward += float(reward)
             total_steps += 1
 
-            # warmup episode에서는 update하지 않는다.
-            # episode 시작 시점부터 train episode였을 때만 update한다.
             if not is_warmup_episode:
                 trainer.update()
 
@@ -1351,14 +1311,14 @@ def main():
             f'({progress_pct:.1f}%) | '
             f'speed: {avg_speed:.2f} | '
             f'line: {last_line_idx} | '
+            f'switches: {ep_line_switches} '
+            f'(straight: {ep_straight_switches}) | '
             f'crash: {collisions} | '
-            f'no_prog_bad: {no_progress_bad_count} | '
             f'lap_time: {lap_time_str} | '
             f'ep_steps: {episode_step} | '
             f'total_steps: {total_steps}'
         )
 
-        # warmup이 끝난 뒤부터만 eval/save한다.
         if (
             total_steps >= TRAIN_CONFIG['warmup_steps']
             and episode > 0

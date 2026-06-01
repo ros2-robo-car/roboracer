@@ -772,7 +772,7 @@ def main():
 
             env_action = np.array([[steering, cmd_speed]], dtype=np.float32)
             next_obs_raw, _, done, _ = env.step(env_action)
-            #env.render()
+            env.render()
 
             current_collision = bool(next_obs_raw['collisions'][0])
             actual_speed = abs(float(next_obs_raw['linear_vels_x'][0]))
