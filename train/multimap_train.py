@@ -3,8 +3,10 @@ multimap_train.py
 
 여러 맵을 순서대로 돌며 학습하는 멀티맵 학습 스크립트
 
-분리 entropy Trainer(alpha_line / alpha_speed)와 호환되도록 저장 로직을 보강한 버전
-
+변경 사항 (기존 대비):
+  1. train_node → train_node_line_stable import (_get_local_curvature, compute_line_switch_penalty 추가)
+  2. run_episode: 라인 전환 추적 + 직진 라인 전환 패널티 적용
+  3. print_episode: switches (straight) 로그 출력 추가
 """
 
 import os
@@ -36,6 +38,7 @@ from sac_model import get_obs_dim
 from waypoint_loader import load_waypoints
 from pure_pursuit import PurePursuitController
 
+
 from train_node import (
     CheckpointTracker,
     WarmupCheckpointBaseline,
@@ -49,6 +52,8 @@ from train_node import (
     is_valid_obs,
     get_collision_penalty,
     compute_steer_change_penalty,
+    _get_local_curvature,
+    compute_line_switch_penalty,
     NUM_CHECKPOINTS,
     BASELINE_STEPS,
     WARMUP_BASELINE_MIN_SAMPLES,
@@ -89,12 +94,6 @@ def is_valid_transition(obs, action, reward, next_obs) -> bool:
 
 
 def build_checkpoint_payload(trainer: Trainer) -> dict:
-    """
-    모델 저장 payload를 만든다.
-
-    split entropy 버전 Trainer는 log_alpha_line / log_alpha_speed를 가진다.
-    예전 Trainer와도 호환되도록 해당 attribute가 있을 때만 저장한다.
-    """
     payload = {
         'model_state': trainer.model.state_dict(),
         'model_config': {
@@ -110,13 +109,10 @@ def build_checkpoint_payload(trainer: Trainer) -> dict:
         },
     }
 
-    # split entropy Trainer용 alpha 상태 저장
     if hasattr(trainer, 'log_alpha_line'):
         payload['log_alpha_line'] = trainer.log_alpha_line.detach().cpu()
     if hasattr(trainer, 'log_alpha_speed'):
         payload['log_alpha_speed'] = trainer.log_alpha_speed.detach().cpu()
-
-    # 구버전 단일 alpha Trainer와도 호환
     if hasattr(trainer, 'log_alpha'):
         payload['log_alpha'] = trainer.log_alpha.detach().cpu()
 
@@ -124,17 +120,12 @@ def build_checkpoint_payload(trainer: Trainer) -> dict:
 
 
 def save_trainer(trainer: Trainer, path: str):
-    """
-    train_node.Trainer에 save()가 있으면 그 함수를 우선 사용한다.
-    save()가 없는 Trainer인 경우에도 split entropy alpha 상태를 함께 저장한다.
-    """
     if hasattr(trainer, 'save') and callable(getattr(trainer, 'save')):
         trainer.save(path)
         return
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(build_checkpoint_payload(trainer), path)
-
     print(f'  모델 저장: {path}')
 
 
@@ -301,6 +292,10 @@ def run_episode(
     last_lap_step = 0
     next_lap_progress = n_waypoints
 
+    prev_line_idx = None
+    ep_line_switches = 0
+    ep_straight_switches = 0
+
     try:
         obs_raw, _, _, _ = env.reset(poses=init_poses)
         obs = preprocess_obs(obs_raw, waypoints_lines, num_lines)
@@ -411,7 +406,6 @@ def run_episode(
                 use_speed_reward=not is_warmup,
             )
 
-            # warmup 중에는 해당 맵의 checkpoint별 baseline sample을 저장
             if is_warmup and checkpoint_passed:
                 baseline_provider.add(checkpoint_idx, segment_steps)
 
@@ -423,6 +417,24 @@ def run_episode(
             )
             reward -= steer_change_penalty
             prev_steering = current_steering
+
+            line_changed = (
+                prev_line_idx is not None
+                and line_idx != prev_line_idx
+            )
+
+            if line_changed:
+                ep_line_switches += 1
+                curvature = _get_local_curvature(
+                    next_obs_raw, waypoints_lines[line_idx],
+                )
+                switch_penalty = compute_line_switch_penalty(curvature, line_changed)
+                if switch_penalty > 0:
+                    reward -= switch_penalty
+                    ep_straight_switches += 1
+
+            prev_line_idx = line_idx
+            # ══════════════════════════════════════════════════════════════
 
             no_progress_done = False
             if not current_collision:
@@ -529,6 +541,8 @@ def run_episode(
         'no_prog_bad': no_progress_bad_count,
         'lap_time': format_lap_times(lap_times),
         'baseline': baseline_summary,
+        'line_switches': ep_line_switches,
+        'straight_switches': ep_straight_switches,
     }
 
 
@@ -543,6 +557,8 @@ def print_episode(tag: str, ep: int, r: dict, total_steps: int):
         f'crash: {r["crash"]} | '
         f'speed: {r["avg_speed"]:.2f} | '
         f'line: {r["line_idx"]} | '
+        f'switches: {r.get("line_switches", 0)} '
+        f'(straight: {r.get("straight_switches", 0)}) | '
         f'no_prog_bad: {r.get("no_prog_bad", 0)} | '
         f'timeout: {r.get("timeout", 0)} | '
         f'lap_time: {r.get("lap_time", "-")} | '
@@ -714,6 +730,8 @@ def main():
     num_cycles = MULTIMAP_CONFIG['num_cycles']
     warmup_steps = MULTIMAP_CONFIG['warmup_steps']
     train_steps = MULTIMAP_CONFIG['train_steps']
+    train_steps_decay = MULTIMAP_CONFIG.get('train_steps_decay', 1.0)
+    train_steps_min = MULTIMAP_CONFIG.get('train_steps_min', train_steps)
     max_steps_ep = MULTIMAP_CONFIG['max_steps_per_ep']
     eval_episodes = MULTIMAP_CONFIG['eval_episodes']
 
@@ -778,7 +796,6 @@ def main():
         cycle_map_data = map_cache.load(cycle_map_name)
         cycle_baseline = map_baselines[cycle_map_name]
 
-        # train_node.Trainer.evaluate()를 쓸 경우를 대비해 현재 맵 baseline을 연결
         trainer.checkpoint_baselines = cycle_baseline
 
         print(f'\n{"═" * 70}')
@@ -791,6 +808,10 @@ def main():
         print(f'baseline: {cycle_baseline.compact_summary()}')
         print(f'{"═" * 70}')
 
+        cycle_train_steps = max(
+            train_steps_min,
+            int(train_steps * (train_steps_decay ** cycle))
+        )
         phase_start = total_steps
         phase_target = phase_start + warmup_steps
         phase_ep = 0
@@ -839,7 +860,7 @@ def main():
         phase_ep = 0
 
         print(
-            f'\n[학습] 목표: ~{train_steps:,} 스텝 | '
+            f'\n[학습] 목표: ~{cycle_train_steps:,} 스텝 | '
             f'맵: {cycle_map_name}'
         )
 
