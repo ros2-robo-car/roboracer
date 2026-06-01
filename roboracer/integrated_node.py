@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import rclpy
 from rclpy.node import Node
 import numpy as np
@@ -13,7 +14,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from config import (
     OBS_CONFIG, LINE_CONFIG, MODEL_CONFIG, PURE_PURSUIT_CONFIG,
-    SPEED_MIN, SPEED_MAX, MODEL_SAVE_PATH,
+    REWARD_CONFIG, SPEED_MIN, SPEED_MAX, MODEL_SAVE_PATH,
 )
 from sac_model import SAC, get_obs_dim, build_observation
 from waypoint_loader import load_waypoints
@@ -40,6 +41,18 @@ CURVATURE_MAX    = OBS_CONFIG.get('curvature_max_value', 1.5)
 OBS_DIM          = get_obs_dim(LIDAR_SIZE, NUM_LINES, use_line_curvature=USE_CURVATURE)
 OBS_DIM_FALLBACK = LIDAR_SIZE
 
+# ── 속도 제어 상수 (train/eval_node와 동일한 공식 사용) ──────────────────────
+# action[1] (-1~1) → pp_speed 기준 배율: 1.0 + SAC_SPEED_SCALE_RANGE * action[1]
+# 예: scale_range=0.3이면 pp_speed의 70%~130% 범위로 조절
+SAC_SPEED_SCALE_RANGE = REWARD_CONFIG.get('sac_speed_scale_range', 0.2)
+TARGET_SPEED_MIN      = REWARD_CONFIG.get('target_speed_min', 0.5)
+BRAKE_GAIN            = REWARD_CONFIG.get('brake_gain', 0.5)
+
+# ── 디버그 출력 상수 ──────────────────────────────────────────────────────────
+# N 스텝마다 한 번 출력 (LiDAR 콜백 호출 기준)
+# 예: 10이면 약 100ms마다 출력 (LiDAR 10Hz 가정)
+DEBUG_INTERVAL = 10
+
 
 def _compute_three_point_curvature(p0, p1, p2):
     d01 = np.linalg.norm(p1 - p0)
@@ -58,7 +71,7 @@ def _compute_line_lookahead_curvatures(waypoints_lines, position, speed):
         base        = int(PURE_PURSUIT_CONFIG.get('lookahead_window_base', 5))
         scale       = int(PURE_PURSUIT_CONFIG.get('lookahead_window_speed_scale', 2))
         window      = base + int(abs(speed) * scale)
-        sample_step = int(PURE_PURSUIT_CONFIG.get('curvature_sample_step', 2))  # ← 오타 수정
+        sample_step = int(PURE_PURSUIT_CONFIG.get('curvature_sample_step', 2))
     else:
         window      = int(OBS_CONFIG.get('curvature_lookahead_window', 30))
         sample_step = int(OBS_CONFIG.get('curvature_sample_step', 2))
@@ -104,6 +117,12 @@ class IntegratedNode(Node):
       - LiDAR 타임아웃: /scan 0.2초 이상 끊기면 긴급 정지
       - 오돔 타임아웃: /odom 0.2초 이상 끊기면 긴급 정지
       - Pose 타임아웃: /amcl_pose 수신 후 1.0초 이상 끊기면 긴급 정지
+
+    디버그 출력 (DEBUG_INTERVAL 스텝마다):
+      - 선택된 라인 인덱스
+      - SAC 속도 / PP 속도 / 최종 명령 속도
+      - 조향각
+      - SAC 추론 시간 (소수점 4자리 ms)
     """
 
     def __init__(self):
@@ -122,11 +141,14 @@ class IntegratedNode(Node):
         self.last_pose_time = self.get_clock().now()
         self.scan_received  = False
 
+        # ── 디버그 스텝 카운터 ────────────────────────────────────────────
+        self._step_count = 0
+
         # ── 웨이포인트 로드 (모델보다 먼저!) ──────────────────────────────
         self._load_waypoints()
 
         self.controller = PurePursuitController(
-            max_speed=SPEED_MAX, min_speed=SPEED_MIN
+            max_speed=REAL_SPEED_MAX, min_speed=TARGET_SPEED_MIN
         )
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -174,7 +196,8 @@ class IntegratedNode(Node):
 
         self.get_logger().info(
             f'integrated_node started | obs_dim={self._obs_dim} '
-            f'| use_curvature={USE_CURVATURE} | device={self.device}'
+            f'| use_curvature={USE_CURVATURE} | device={self.device} '
+            f'| debug_interval={DEBUG_INTERVAL} steps'
         )
         self.get_logger().info(
             '/amcl_pose 미수신 시 /odom으로 위치 fallback 동작'
@@ -345,8 +368,11 @@ class IntegratedNode(Node):
             )
             return
 
-        # [STEP 4] SAC 추론
-        action    = self.model.select_action(obs, training=False)
+        # [STEP 4] SAC 추론 + 추론 시간 측정
+        _t_infer_start = time.perf_counter()
+        action = self.model.select_action(obs, training=False)
+        infer_ms = (time.perf_counter() - _t_infer_start) * 1000.0  # ms, 소수점 4자리
+
         line_idx  = self.model.action_to_line_index(action)
         waypoints = self.waypoints_lines[line_idx]
 
@@ -355,13 +381,39 @@ class IntegratedNode(Node):
             position_snapshot[0], position_snapshot[1],
             heading_snapshot, speed_snapshot, waypoints,
         )
-        final_speed = min(
-            self.model.action_to_speed(action, SPEED_MIN, SPEED_MAX),
-            pp_speed,
-        )
 
-        # [STEP 6] /drive 발행
+        # [STEP 6] 목표 속도 계산 (train/eval_node와 동일한 공식)
+        #   speed_scale : action[1](-1~1) 기반 배율  → 1.0 ± SAC_SPEED_SCALE_RANGE
+        #   target_speed: pp_speed에 배율 적용 후 클리핑
+        #   final_speed : apply_brake로 급격한 가속 완화
+        speed_action = float(np.clip(action[1], -1.0, 1.0))
+        speed_scale  = 1.0 + SAC_SPEED_SCALE_RANGE * speed_action
+        target_speed = float(np.clip(
+            pp_speed * speed_scale, TARGET_SPEED_MIN, REAL_SPEED_MAX
+        ))
+        # 현재 속도보다 목표가 낮으면 브레이크 명령으로 부드럽게 감속
+        if speed_snapshot > target_speed:
+            diff        = speed_snapshot - target_speed
+            final_speed = float(max(target_speed - BRAKE_GAIN * diff, 0.0))
+        else:
+            final_speed = target_speed
+
+        # [STEP 7] /drive 발행
         self._publish_drive(steering, final_speed)
+
+        # [STEP 8] 주기적 디버그 출력
+        self._step_count += 1
+        if self._step_count % DEBUG_INTERVAL == 0:
+            self.get_logger().info(
+                f'[DBG step={self._step_count}] '
+                f'line={line_idx}/{NUM_LINES - 1} | '
+                f'scale={speed_action:+.3f} '      # SAC raw 배율 (-1~1)
+                f'pp={pp_speed:.2f} '              # PP 기준 속도 (m/s)
+                f'tgt={target_speed:.2f} '         # 배율 적용 목표 속도
+                f'final={final_speed:.2f} m/s | '  # 브레이크 후 실제 명령 속도
+                f'steer={steering:+.3f} rad | '
+                f'infer={infer_ms:.4f} ms'
+            )
 
     def _publish_drive(self, steering: float, speed: float, force_stop: bool = False):
         steering = float(np.clip(steering, -MAX_STEERING, MAX_STEERING))
