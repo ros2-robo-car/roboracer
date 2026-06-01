@@ -160,8 +160,8 @@ PURE_PURSUIT_CONFIG = {
 # ══════════════════════════════════════════════════════════════════════════════
 PROJECT_ROOT    = os.path.dirname(os.path.abspath(__file__))
 MODEL_SAVE_PATH = os.path.join(PROJECT_ROOT, 'models', 'sac_model.pth')
-MULTIMAP_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_multimap3.pth')
-MULTIMAP_FINAL_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_multimap_final4.pth')
+MULTIMAP_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_multimap.pth')
+MULTIMAP_FINAL_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_multimap_final.pth')
 QUANTIZED_PATH  = os.path.join(PROJECT_ROOT, 'models', 'sac_model_quantized.pth')
 
 
