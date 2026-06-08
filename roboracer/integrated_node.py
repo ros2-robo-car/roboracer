@@ -127,55 +127,75 @@ class IntegratedNode(Node):
 
     def __init__(self):
         super().__init__('integrated_node')
-
+ 
         # ── 상태 변수 ─────────────────────────────────────────────────────
         self.position      = np.array([0.0, 0.0])
         self.heading       = 0.0
         self.speed         = 0.0
         self.odom_received = False
         self.pose_received = False  # /amcl_pose 수신 여부
-
+ 
         # ── 타임아웃 감시용 시각 ──────────────────────────────────────────
         self.last_odom_time = self.get_clock().now()
         self.last_scan_time = self.get_clock().now()
         self.last_pose_time = self.get_clock().now()
         self.scan_received  = False
-
+ 
         # ── 디버그 스텝 카운터 ────────────────────────────────────────────
         self._step_count = 0
-
+ 
         # ── 웨이포인트 로드 (모델보다 먼저!) ──────────────────────────────
         self._load_waypoints()
-
+ 
         self.controller = PurePursuitController(
             max_speed=REAL_SPEED_MAX, min_speed=TARGET_SPEED_MIN
         )
-
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = SAC(
-            self._obs_dim,  # _load_waypoints 후에 설정된 값 사용
-            MODEL_CONFIG['action_dim'],
-            MODEL_CONFIG['hidden_dims'],
-            num_lines=NUM_LINES,
-        ).to(self.device)
-
+ 
+        if 'qnnpack' in torch.backends.quantized.supported_engines:
+            torch.backends.quantized.engine = 'qnnpack'
+ 
+        # ── device는 CPU 고정 ──
+        self.device = torch.device('cpu')
+ 
         if os.path.exists(MODEL_SAVE_PATH):
-            ckpt = torch.load(MODEL_SAVE_PATH, map_location=self.device)
-            if isinstance(ckpt, dict) and 'model_state' in ckpt:
-                self.model.load_state_dict(ckpt['model_state'])
+            ckpt = torch.load(MODEL_SAVE_PATH, map_location='cpu', weights_only=False)
+ 
+            if isinstance(ckpt, torch.nn.Module):
+                # (A) 양자화 모델 등 객체 통째로 저장된 경우 → 그대로 사용
+                self.model = ckpt
+                self.get_logger().info(f'모델 로드(객체): {MODEL_SAVE_PATH}')
             else:
-                self.model.load_state_dict(ckpt)
-            self.get_logger().info(f'모델 로드: {MODEL_SAVE_PATH}')
+                # (B) FP32 state_dict 형태 → 모델을 만들어 가중치만 적재
+                self.model = SAC(
+                    self._obs_dim,  # _load_waypoints 후에 설정된 값 사용
+                    MODEL_CONFIG['action_dim'],
+                    MODEL_CONFIG['hidden_dims'],
+                    num_lines=NUM_LINES,
+                )
+                if isinstance(ckpt, dict) and 'model_state' in ckpt:
+                    self.model.load_state_dict(ckpt['model_state'])
+                else:
+                    self.model.load_state_dict(ckpt)
+                self.get_logger().info(f'모델 로드(state_dict): {MODEL_SAVE_PATH}')
         else:
+            # 체크포인트가 없을 때만 빈 모델 생성(이전 동작 유지)
+            self.model = SAC(
+                self._obs_dim,
+                MODEL_CONFIG['action_dim'],
+                MODEL_CONFIG['hidden_dims'],
+                num_lines=NUM_LINES,
+            )
             self.get_logger().warn(f'모델 없음: {MODEL_SAVE_PATH}')
+ 
+        self.model.to(self.device)
         self.model.eval()
-
+ 
         # ── 타임아웃 감시 타이머 (0.1초마다 체크) ─────────────────────────
         self.timeout_timer = self.create_timer(0.1, self._check_timeouts)
-
+ 
         # ── AMCL 초기 위치 발행용 일회성 타이머 ───────────────────────────
         self.init_pose_timer = self.create_timer(1.5, self._publish_initial_pose)
-
+ 
         # ── 구독 / 발행 ───────────────────────────────────────────────────
         self.lidar_sub = self.create_subscription(
             LaserScan, '/scan', self.lidar_callback, 10
@@ -193,7 +213,7 @@ class IntegratedNode(Node):
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped, '/drive', 10
         )
-
+ 
         self.get_logger().info(
             f'integrated_node started | obs_dim={self._obs_dim} '
             f'| use_curvature={USE_CURVATURE} | device={self.device} '
